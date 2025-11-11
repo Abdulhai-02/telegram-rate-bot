@@ -280,7 +280,24 @@ def main():
     log_to_channel("🚀 Бот перезапущен и готов к работе")
     bot.infinity_polling(skip_pending=True)
 
-iif __name__ == "__main__":
+# ============== АНТИ-СОН ДЛЯ RENDER ==============
+import threading, time, requests
+
+def keep_awake():
+    """Автоматический пинг Render, чтобы бот не засыпал."""
+    url = "https://telegram-rate-bot-ooc6.onrender.com"  # <-- вставь свой Render URL
+    while True:
+        try:
+            requests.get(url, timeout=5)
+            print(f"[keep_alive] Pinged {url}")
+        except Exception as e:
+            print(f"[keep_alive] Ошибка пинга: {e}")
+        time.sleep(600)  # каждые 10 минут (600 сек)
+
+# Запуск в отдельном потоке
+threading.Thread(target=keep_awake, daemon=True).start()
+
+if __name__ == "__main__":
     try:
         # Отправляем уведомление в Telegram (только при запуске)
         admin_id = -1003264764082  # сюда можешь указать свой Telegram ID или ID канала логов
