@@ -297,6 +297,22 @@ def keep_awake():
 # Запуск в отдельном потоке
 threading.Thread(target=keep_awake, daemon=True).start()
 
+# ============== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ==============
+from flask import Flask
+import threading
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running OK", 200
+
+def run_web():
+    """Фейковый веб-сервер, чтобы Render не ругался на порты."""
+    app.run(host="0.0.0.0", port=10000)
+
+# Запуск веб-сервера в фоне
+threading.Thread(target=run_web, daemon=True).start()
 if __name__ == "__main__":
     try:
         # Отправляем уведомление в Telegram (только при запуске)
