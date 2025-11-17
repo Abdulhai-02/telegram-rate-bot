@@ -17,14 +17,20 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
 ADMIN_LOG_CHAT_ID = -1003264764082
-AUTO_INTERVAL_SECONDS = 60 * 60 * 24
+AUTO_INTERVAL_SECONDS = 60 * 60 * 24  # осталось как было (по сути = 24 часа)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 BTN_SHOW = "📊 Показать курс"
 BTN_AUTO = "🔔 Автообновление"
 BTN_PROFILE = "👤 Профиль"
 
-AUTO_USERS = set()
+# автообновления теперь с настройкой частоты
+AUTO_INTERVAL_1H = 60 * 60
+AUTO_INTERVAL_5H = 5 * 60 * 60
+AUTO_INTERVAL_24H = 24 * 60 * 60
+
+# chat_id -> {"interval": seconds, "last": datetime}
+AUTO_USERS = {}
 USER_STATS = defaultdict(lambda: {"requests": 0, "last": None})
 
 logging.basicConfig(level=logging.INFO)
@@ -53,6 +59,16 @@ def log_user_action(user, action):
         f"👤 @{user.username or 'без_username'} (ID {user.id})\n"
         f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК\n➡️ {action}"
     )
+
+def human_interval(seconds: int) -> str:
+    if seconds == AUTO_INTERVAL_1H:
+        return "каждый 1 час"
+    if seconds == AUTO_INTERVAL_5H:
+        return "каждые 5 часов"
+    if seconds == AUTO_INTERVAL_24H:
+        return "каждые 24 часа"
+    hours = int(seconds // 3600)
+    return f"каждые {hours} ч."
 
 # ============== API ==============
 def get_upbit_usdt_krw():
@@ -131,8 +147,57 @@ def get_krw_rub_from_google():
 
     return cache if cache else None
 
+def get_abcex_usdt_rub():
+    """
+    Возвращает (buy_price, sell_price) для ABCEX USDT/RUB.
+    buy_price  = лучшая цена покупки USDT (bid)
+    sell_price = лучшая цена продажи USDT (ask)
+    """
+    url = "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
+    params = {
+        "instrumentCode": "USDTRUB",
+        "lang": "ru"
+    }
+
+    cache = getattr(get_abcex_usdt_rub, "_cache", None)
+    last_time = getattr(get_abcex_usdt_rub, "_last", 0)
+
+    # немного кэша, чтобы не ддосить (20 секунд)
+    if cache and time.time() - last_time < 20:
+        return cache
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+            "Origin": "https://abcex.io",
+            "Referer": "https://abcex.io/"
+        }
+
+        r = requests.get(url, params=params, headers=headers, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+
+        bids = data.get("data", {}).get("bids", [])
+        asks = data.get("data", {}).get("asks", [])
+
+        if not bids or not asks:
+            return (None, None)
+
+        best_buy = float(bids[0][0])   # покупка USDT за RUB
+        best_sell = float(asks[0][0])  # продажа USDT за RUB
+
+        result = (best_buy, best_sell)
+        get_abcex_usdt_rub._cache = result
+        get_abcex_usdt_rub._last = time.time()
+        return result
+
+    except Exception:
+        logger.exception("Ошибка получения ABCEX USDT/RUB")
+        return cache if cache else (None, None)
+
 # ============== ТЕКСТ КУРСА ==============
-def build_rate_text(upbit, bithumb, rub):
+def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     upbit_txt   = f"<b>{fmt_num(upbit, 0)} ₩</b>" if upbit else "<b>—</b>"
     bithumb_txt = f"<b>{fmt_num(bithumb, 0)} ₩</b>" if bithumb else "<b>—</b>"
     rub_txt     = f"<b>{fmt_num(rub, 2)} ₽</b>" if rub else "<b>—</b>"
@@ -142,6 +207,17 @@ def build_rate_text(upbit, bithumb, rub):
         "──────────────────────\n"
         f"🟢 <b>UPBIT</b>       1 USDT = {upbit_txt}\n"
         f"🟡 <b>BITHUMB</b>  1 USDT = {bithumb_txt}\n"
+    )
+
+    # блок ABCEX, если удалось взять курс
+    if ab_buy and ab_sell:
+        body += (
+            f"🟣 <b>ABCEX</b>\n"
+            f"   Покупка: <b>{fmt_num(ab_buy, 2)} ₽</b>\n"
+            f"   Продажа: <b>{fmt_num(ab_sell, 2)} ₽</b>\n"
+        )
+
+    body += (
         "──────────────────────\n"
         f"🇰🇷➡️🇷🇺   <b>1 000 000 ₩ ≈ {rub_txt}</b> (Google Finance)\n"
         "──────────────────────\n"
@@ -160,20 +236,49 @@ def build_rate_text(upbit, bithumb, rub):
 # ============== АВТООБНОВЛЕНИЕ ==============
 def auto_update_loop():
     while True:
-        time.sleep(AUTO_INTERVAL_SECONDS)
+        # проверяем раз в минуту
+        time.sleep(60)
         if not AUTO_USERS:
             continue
         try:
+            now = now_msk()
+            # отправляем только с 08:00 до 23:00 МСК
+            if now.hour < 8 or now.hour >= 23:
+                continue
+
             with concurrent.futures.ThreadPoolExecutor() as ex:
                 fu_u = ex.submit(get_upbit_usdt_krw)
                 fu_b = ex.submit(get_bithumb_usdt_krw)
                 fu_r = ex.submit(get_krw_rub_from_google)
+                fu_ab = ex.submit(get_abcex_usdt_rub)
                 u, b, r = fu_u.result(), fu_b.result(), fu_r.result()
+                ab_buy, ab_sell = fu_ab.result()
 
-            txt = build_rate_text(u, b, r)
-            for c in list(AUTO_USERS):
-                bot.send_message(c, txt)
-            log_to_channel(f"⏱ Автообновление {len(AUTO_USERS)} пользователей {now_msk().strftime('%H:%M:%S')}")
+            if not any([u, b, r, ab_buy, ab_sell]):
+                continue
+
+            txt = build_rate_text(u, b, r, ab_buy=ab_buy, ab_sell=ab_sell)
+
+            for chat_id, cfg in list(AUTO_USERS.items()):
+                interval = cfg.get("interval", AUTO_INTERVAL_24H)
+                last = cfg.get("last")
+
+                if last and (now - last).total_seconds() < interval:
+                    continue
+
+                try:
+                    bot.send_message(chat_id, txt)
+                    AUTO_USERS[chat_id]["last"] = now
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить автообновление {chat_id}: {e}")
+                    # если пользователь удалился/заблокировал — удаляем из списка
+                    if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+                        AUTO_USERS.pop(chat_id, None)
+
+            log_to_channel(
+                f"⏱ Автообновление {len(AUTO_USERS)} пользователей "
+                f"{now.strftime('%H:%M:%S')}"
+            )
         except Exception:
             logger.exception("Ошибка автообновления")
 
@@ -222,17 +327,19 @@ def show_rate(m):
         fu_u = ex.submit(get_upbit_usdt_krw)
         fu_b = ex.submit(get_bithumb_usdt_krw)
         fu_r = ex.submit(get_krw_rub_from_google)
+        fu_ab = ex.submit(get_abcex_usdt_rub)
         u, b, r = fu_u.result(), fu_b.result(), fu_r.result()
+        ab_buy, ab_sell = fu_ab.result()
 
     stop["run"] = False
     time.sleep(0.5)
 
-    if not any([u, b, r]):
+    if not any([u, b, r, ab_buy, ab_sell]):
         bot.edit_message_text("⚠️ Сейчас не удалось получить курс.\nПопробуйте чуть позже.", chat_id, msg.message_id)
         log_user_action(m.from_user, "ошибка получения курса")
         return
 
-    txt = build_rate_text(u, b, r)
+    txt = build_rate_text(u, b, r, ab_buy=ab_buy, ab_sell=ab_sell)
     bot.edit_message_text(txt, chat_id, msg.message_id, parse_mode="HTML")
 
     update_user_stats(m.from_user)
@@ -241,7 +348,9 @@ def show_rate(m):
         f"🕒 {now_msk().strftime('%H:%M:%S')} МСК\n"
         f"Upbit: {fmt_num(u,0) if u else '—'} | "
         f"Bithumb: {fmt_num(b,0) if b else '—'} | "
-        f"Google: {fmt_num(r,2) if r else '—'} ₽"
+        f"Google: {fmt_num(r,2) if r else '—'} ₽ | "
+        f"ABCEX buy/sell: "
+        f"{fmt_num(ab_buy,2) if ab_buy else '—'} / {fmt_num(ab_sell,2) if ab_sell else '—'} ₽"
     )
 
 # ============== ПРОЧИЕ КНОПКИ ==============
@@ -249,23 +358,70 @@ def show_rate(m):
 def toggle_auto(m):
     ensure_keyboard(m)
     chat_id = m.chat.id
+
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("⏱ Каждый 1 час", callback_data="auto_1h"),
+        types.InlineKeyboardButton("⏱ Каждые 5 часов", callback_data="auto_5h"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("🕛 Раз в 24 часа", callback_data="auto_24h"),
+    )
     if chat_id in AUTO_USERS:
-        AUTO_USERS.remove(chat_id)
+        kb.row(
+            types.InlineKeyboardButton("🔕 Выключить автообновление", callback_data="auto_off")
+        )
+
+    text = "Выбери частоту автообновления курса:"
+    if chat_id in AUTO_USERS:
+        cur_int = AUTO_USERS[chat_id].get("interval", AUTO_INTERVAL_24H)
+        text += f"\nСейчас: {human_interval(cur_int)}."
+
+    bot.send_message(chat_id, text, reply_markup=kb)
+    log_user_action(m.from_user, "открыл настройки автообновления")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
+def auto_callback(c):
+    chat_id = c.message.chat.id
+    data = c.data
+
+    if data == "auto_off":
+        AUTO_USERS.pop(chat_id, None)
+        bot.answer_callback_query(c.id, "Автообновление выключено")
         bot.send_message(chat_id, "🔕 Автообновление выключено.")
-        log_user_action(m.from_user, "выключил автообновление")
+        log_user_action(c.from_user, "выключил автообновление")
+        return
+
+    if data == "auto_1h":
+        interval = AUTO_INTERVAL_1H
+        label = "каждый 1 час"
+    elif data == "auto_5h":
+        interval = AUTO_INTERVAL_5H
+        label = "каждые 5 часов"
     else:
-        AUTO_USERS.add(chat_id)
-        bot.send_message(m.chat.id, "🔔 Автообновление включено (1 раз в день).")
-        log_user_action(m.from_user, "включил автообновление")
+        interval = AUTO_INTERVAL_24H
+        label = "каждые 24 часа"
+
+    AUTO_USERS[chat_id] = {"interval": interval, "last": None}
+    bot.answer_callback_query(c.id, "Настройки сохранены")
+    bot.send_message(chat_id, f"🔔 Автообновление включено: {label}.")
+    log_user_action(c.from_user, f"включил автообновление ({label})")
 
 @bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
 def profile(m):
     ensure_keyboard(m)
     s = USER_STATS[m.from_user.id]
     last = s["last"].strftime("%d.%m.%Y %H:%M:%S") if s["last"] else "—"
+
+    if m.from_user.username:
+        nick = f"@{m.from_user.username}"
+    else:
+        full_name = " ".join(filter(None, [m.from_user.first_name, m.from_user.last_name]))
+        nick = full_name or "без имени"
+
     txt = (
         f"👤 <b>Профиль</b>\n\n"
-        f"Ник: @{m.from_user.username or 'без_username'}\n"
+        f"Ник: {nick}\n"
         f"ID: <code>{m.from_user.id}</code>\n\n"
         f"Запросов курса: {s['requests']}\n"
         f"Последний запрос: {last} (МСК)"
@@ -313,6 +469,7 @@ def run_web():
 
 # Запуск веб-сервера в фоне
 threading.Thread(target=run_web, daemon=True).start()
+
 if __name__ == "__main__":
     try:
         # Отправляем уведомление в Telegram (только при запуске)
