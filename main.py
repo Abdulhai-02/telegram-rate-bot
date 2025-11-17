@@ -227,19 +227,14 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     "<b>🇰🇷 USDT → KRW</b>\n"
     f"◾ UPBIT:      <b>{upbit_txt}</b>\n"
     f"◾ BITHUMB:    <b>{bithumb_txt}</b>\n\n"
-
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>🇷🇺 USDT → RUB (ABCEX)</b>\n"
     f"◾ Покупка:    <b>{ab_buy_txt}</b>\n"
     f"◾ Продажа:    <b>{ab_sell_txt}</b>\n\n"
-
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
+    "━━━━━━━━━━━━━━━━━━━━\n\n"
     "<b>🇰🇷➡️🇷🇺 KRW → RUB</b>\n"
     f"◾ 1 000 000 ₩ → <b>{rub_txt}</b>\n\n"
-
-    "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+   "━━━━━━━━━━━━━━━━━━━━\n"
     f"⏱ Обновлено: <i>{timestamp} (МСК)</i>\n\n"
 
     "💰 <b>Обмен любых сумм и валют — по договоренности.</b>\n"
