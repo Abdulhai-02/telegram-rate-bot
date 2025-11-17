@@ -458,6 +458,14 @@ def profile(m):
     )
     bot.send_message(m.chat.id, txt)
     log_user_action(m.from_user, "открыл профиль")
+    
+    # ============== АВТОМАТИЧЕСКОЕ ОБНОВЛЕНИЕ КЛАВИАТУРЫ ДЛЯ ВСЕХ ПОЛЬЗОВАТЕЛЕЙ ==============
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def force_keyboard_update(m):
+    try:
+        bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
+    except:
+        pass
 
 # ============== АНТИ-СОН ДЛЯ RENDER ==============
 def keep_awake():
