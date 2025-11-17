@@ -222,29 +222,27 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     timestamp = now_msk().strftime("%d.%m.%Y, %H:%M")
 
     text = (
-    "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n"
-    
+        "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n\n"
 
-    "🇰🇷 <b>USDT → KRW</b>\n"
-    f"• UPBIT:     <b>{upbit_txt}</b>\n"
-    f"• BITHUMB:   <b>{bithumb_txt}</b>\n"
-    "━━━━━━━━━━━━━━━━━━"
+        "🇰🇷 <b>USDT → KRW</b>\n"
+        f"◾ UPBIT:      <b>{upbit_txt}</b>\n"
+        f"◾ BITHUMB:    <b>{bithumb_txt}</b>\n"
+        "━━━━━━━━━━━━━━\n\n"
 
-    "🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
-    f"• Покупка:   <b>{ab_buy_txt}</b>\n"
-    f"• Продажа:   <b>{ab_sell_txt}</b>\n"
-    "━━━━━━━━━━━━━━━━━━"
+        "🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
+        f"◾ Покупка:    <b>{ab_buy_txt}</b>\n"
+        f"◾ Продажа:    <b>{ab_sell_txt}</b>\n"
+        "━━━━━━━━━━━━━━\n\n"
 
-    "🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-    f"• 1 000 000 ₩ = <b>{rub_txt}</b>\n"
-    "━━━━━━━━━━━━━━━━━━"
+        "🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
+        f"◾ 1 000 000 ₩ → <b>{rub_txt}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"⏱ Обновлено: <b>{timestamp} (МСК)</b>\n\n"
 
-    f"⏱ Обновлено: <b>{timestamp}</b> (МСК)\n"
-    
+        "💰 Обмен любых сумм и валют — по договоренности.\n"
+        "📞 Контакт: @Abdulkhaiii"
+    )
 
-    "💰 <b>Обмен всех валют только по договорённости</b>\n"
-    "📞 <b>Контакт:</b> @Abdulkhaiii"
-)
     return text
 
 # ============== АВТООБНОВЛЕНИЕ ==============
