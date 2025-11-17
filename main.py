@@ -2,10 +2,12 @@
 import os, logging, threading, time, re, concurrent.futures
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+
 import requests
 from dotenv import load_dotenv
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 from bs4 import BeautifulSoup
 
 # ============== НАСТРОЙКИ ==============
@@ -24,7 +26,7 @@ BTN_SHOW = "📊 Показать курс"
 BTN_AUTO = "🔔 Автообновление"
 BTN_PROFILE = "👤 Профиль"
 
-# автообновления теперь с настройкой частоты
+# автообновления с настройкой частоты
 AUTO_INTERVAL_1H = 60 * 60
 AUTO_INTERVAL_5H = 5 * 60 * 60
 AUTO_INTERVAL_24H = 24 * 60 * 60
@@ -429,19 +431,10 @@ def profile(m):
     bot.send_message(m.chat.id, txt)
     log_user_action(m.from_user, "открыл профиль")
 
-# ============== ЗАПУСК ==============
-def main():
-    threading.Thread(target=auto_update_loop, daemon=True).start()
-    logger.info("Бот запущен.")
-    log_to_channel("🚀 Бот перезапущен и готов к работе")
-    bot.infinity_polling(skip_pending=True)
-
 # ============== АНТИ-СОН ДЛЯ RENDER ==============
-import threading, time, requests
-
 def keep_awake():
     """Автоматический пинг Render, чтобы бот не засыпал."""
-    url = "https://telegram-rate-bot-ooc6.onrender.com"  # <-- вставь свой Render URL
+    url = "https://telegram-rate-bot-ooc6.onrender.com"  # <-- твой Render URL
     while True:
         try:
             requests.get(url, timeout=5)
@@ -450,12 +443,8 @@ def keep_awake():
             print(f"[keep_alive] Ошибка пинга: {e}")
         time.sleep(600)  # каждые 10 минут (600 сек)
 
-# Запуск в отдельном потоке
-threading.Thread(target=keep_awake, daemon=True).start()
-
 # ============== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ==============
 from flask import Flask
-import threading
 
 app = Flask(__name__)
 
@@ -465,30 +454,49 @@ def home():
 
 def run_web():
     """Фейковый веб-сервер, чтобы Render не ругался на порты."""
-    import os
-    port = int(os.environ.get("PORT", 10000))  # <-- ключевое исправление
+    port = int(os.environ.get("PORT", 10000))
     print(f"[web] Using PORT={port}")
     app.run(host="0.0.0.0", port=port)
-    
-# Запуск веб-сервера в фоне
-threading.Thread(target=run_web, daemon=True).start()
+
+# ============== ЗАПУСК ==============
+def main():
+    # фоновые потоки
+    threading.Thread(target=auto_update_loop, daemon=True).start()
+    threading.Thread(target=keep_awake, daemon=True).start()
+    threading.Thread(target=run_web, daemon=True).start()
+
+    logger.info("Бот запущен.")
+    log_to_channel("🚀 Бот перезапущен и готов к работе")
+
+    # устойчивый polling с перехватом 409
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True)
+        except ApiTelegramException as e:
+            # конфликт getUpdates (кто-то ещё использует этот токен)
+            if "Conflict: terminated by other getUpdates request" in str(e):
+                logger.error("⚠️ 409 Conflict от Telegram (другой getUpdates). Ждём 10 сек и пробуем заново.")
+                time.sleep(10)
+                continue
+            logger.exception("ApiTelegramException в polling, пробуем перезапустить через 15 сек")
+            time.sleep(15)
+        except Exception:
+            logger.exception("Неожиданная ошибка в polling, перезапуск через 15 сек")
+            time.sleep(15)
 
 if __name__ == "__main__":
     try:
-        # Отправляем уведомление в Telegram (только при запуске)
-        admin_id = -1003264764082  # сюда можешь указать свой Telegram ID или ID канала логов
+        admin_id = ADMIN_LOG_CHAT_ID
         try:
             bot.send_message(admin_id, "♻️ Бот успешно перезапущен и готов к работе!")
         except Exception as e:
             print(f"Ошибка при отправке уведомления администратору: {e}")
 
-        # Запуск основного цикла
         main()
 
     except Exception as e:
-        # Если при старте что-то пошло не так — логируем
-        logging.exception("❌ Ошибка при запуске бота")
+        logging.exception("❌ Фатальная ошибка при запуске бота")
         try:
-            bot.send_message(admin_id, f"⚠️ Ошибка при запуске бота:\n{e}")
+            bot.send_message(ADMIN_LOG_CHAT_ID, f"⚠️ Ошибка при запуске бота:\n{e}")
         except:
             pass
