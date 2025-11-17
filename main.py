@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-import os, logging, threading, time, re, concurrent.futures
+import os
+import logging
+import threading
+import time
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
@@ -9,6 +13,7 @@ import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 from bs4 import BeautifulSoup
+from flask import Flask
 
 # ============== НАСТРОЙКИ ==============
 load_dotenv()
@@ -19,12 +24,12 @@ if not TELEGRAM_TOKEN:
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
 ADMIN_LOG_CHAT_ID = -1003264764082
-AUTO_INTERVAL_SECONDS = 60 * 60 * 24  # осталось как было (по сути = 24 часа)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 BTN_SHOW = "📊 Показать курс"
 BTN_AUTO = "🔔 Автообновление"
 BTN_PROFILE = "👤 Профиль"
+BTN_DISABLE = "🚫 Отключить уведомления"
 
 # автообновления с настройкой частоты
 AUTO_INTERVAL_1H = 60 * 60
@@ -151,18 +156,18 @@ def get_krw_rub_from_google():
 
 def get_abcex_usdt_rub():
     """
-    Профессиональный высокоточный модуль получения курса ABCEX.
+    Профессиональный модуль получения курса ABCEX.
     Возвращает (best_buy, best_sell):
     - best_buy  → по сколько ABCEX покупает USDT (bid)
     - best_sell → по сколько ABCEX продаёт USDT (ask)
     """
-
     url = "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
     params = {"instrumentCode": "USDTRUB", "lang": "ru"}
 
-    # --- КЭШ 15 секунд для стабильности ---
     cache = getattr(get_abcex_usdt_rub, "_cache", None)
     last_time = getattr(get_abcex_usdt_rub, "_last", 0)
+
+    # немного кэша (15 секунд)
     if cache and time.time() - last_time < 15:
         return cache
 
@@ -171,41 +176,31 @@ def get_abcex_usdt_rub():
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
             "Accept": "application/json",
             "Referer": "https://abcex.io/",
-            "Origin": "https://abcex.io"
+            "Origin": "https://abcex.io",
         }
 
         r = requests.get(url, params=params, headers=headers, timeout=4)
         r.raise_for_status()
         data = r.json()
 
-        # ABCEX отдаёт:
-        # "ask": [{"qty": "...", "price": "..."}]
-        # "bid": [{"qty": "...", "price": "..."}]
-        asks = data.get("ask")
-        bids = data.get("bid")
+        asks = data.get("ask") or []
+        bids = data.get("bid") or []
 
         if not asks or not bids:
             raise ValueError("Пустой стакан ABCEX")
 
-        # Лучшая цена — всегда первый элемент
         best_sell = float(asks[0]["price"])   # продажа USDT
         best_buy  = float(bids[0]["price"])   # покупка USDT
 
         result = (best_buy, best_sell)
-
-        # сохраняем кэш
         get_abcex_usdt_rub._cache = result
         get_abcex_usdt_rub._last = time.time()
-
         return result
 
     except Exception as e:
         logger.error(f"Ошибка ABCEX: {e}")
-
-        # если ошибка — возвращаем последний рабочий результат
         if cache:
             return cache
-
         return (None, None)
 
 # ============== ТЕКСТ КУРСА ==============
@@ -237,7 +232,7 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
         f"• Покупка:   <b>{ab_buy_txt}</b>\n"
         f"• Продажа:   <b>{ab_sell_txt}</b>\n\n"
 
-        "💹 <b>KRW → RUB</b>\n"
+        "🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
         f"• 1 000 000 ₩ = <b>{rub_txt}</b>\n\n"
 
         f"⏱ <b>Обновлено: {timestamp} (МСК)</b>\n\n"
@@ -257,7 +252,7 @@ def auto_update_loop():
         try:
             now = now_msk()
             # отправляем только с 08:00 до 23:00 МСК
-            if now.hour < 4 or now.hour >= 23:
+            if now.hour < 8 or now.hour >= 23:
                 continue
 
             with concurrent.futures.ThreadPoolExecutor() as ex:
@@ -277,6 +272,7 @@ def auto_update_loop():
                 interval = cfg.get("interval", AUTO_INTERVAL_24H)
                 last = cfg.get("last")
 
+                # если last есть и интервал ещё не прошёл — пропускаем
                 if last and (now - last).total_seconds() < interval:
                     continue
 
@@ -285,7 +281,6 @@ def auto_update_loop():
                     AUTO_USERS[chat_id]["last"] = now
                 except Exception as e:
                     logger.warning(f"Не удалось отправить автообновление {chat_id}: {e}")
-                    # если пользователь удалился/заблокировал — удаляем из списка
                     if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
                         AUTO_USERS.pop(chat_id, None)
 
@@ -300,29 +295,30 @@ def auto_update_loop():
 def main_keyboard():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(BTN_SHOW, BTN_AUTO)
-    m.row(BTN_PROFILE, "🚫 Отключить уведомления")
+    m.row(BTN_PROFILE, BTN_DISABLE)
     return m
 
 @bot.message_handler(commands=["start","help"])
 def start_handler(m):
     bot.send_message(m.chat.id, "👋 Привет!\n\nВыбери нужный раздел ниже 👇", reply_markup=main_keyboard())
     log_user_action(m.from_user, "нажал /start")
-    @bot.message_handler(func=lambda m: m.text == "🚫 Отключить уведомления")
-
-def disable_notifications(m):
-    chat_id = m.chat.id
-    if chat_id in AUTO_USERS:
-        AUTO_USERS.pop(chat_id, None)
-        bot.send_message(chat_id, "🔕 Уведомления отключены.")
-        log_user_action(m.from_user, "отключил уведомления")
-    else:
-        bot.send_message(chat_id, "Уведомления уже были выключены.")
 
 def ensure_keyboard(m):
     try:
         bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
     except:
         pass
+
+# ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ (КНОПКА) ==============
+@bot.message_handler(func=lambda m: m.text == BTN_DISABLE)
+def disable_notifications(m):
+    chat_id = m.chat.id
+    if chat_id in AUTO_USERS:
+        AUTO_USERS.pop(chat_id, None)
+        bot.send_message(chat_id, "🔕 Уведомления отключены.")
+        log_user_action(m.from_user, "отключил уведомления (кнопка)")
+    else:
+        bot.send_message(chat_id, "Уведомления уже были выключены.")
 
 # ============== ПОКАЗ КУРСА ==============
 @bot.message_handler(func=lambda m: m.text == BTN_SHOW)
@@ -377,7 +373,7 @@ def show_rate(m):
         f"{fmt_num(ab_buy,2) if ab_buy else '—'} / {fmt_num(ab_sell,2) if ab_sell else '—'} ₽"
     )
 
-# ============== ПРОЧИЕ КНОПКИ ==============
+# ============== АВТООБНОВЛЕНИЕ НАСТРОЙКИ ==============
 @bot.message_handler(func=lambda m: m.text == BTN_AUTO)
 def toggle_auto(m):
     ensure_keyboard(m)
@@ -389,7 +385,7 @@ def toggle_auto(m):
         types.InlineKeyboardButton("⏱ Каждые 5 часов", callback_data="auto_5h"),
     )
     kb.row(
-        types.InlineKeyboardButton("🕛 Раз в 24 часа", callback_data="auto_24h"),
+        types.InlineKeyboardButton("🕛 Раз в 24 часа (с 08:00 МСК)", callback_data="auto_24h"),
     )
     if chat_id in AUTO_USERS:
         kb.row(
@@ -413,35 +409,34 @@ def auto_callback(c):
         AUTO_USERS.pop(chat_id, None)
         bot.answer_callback_query(c.id, "Автообновление выключено")
         bot.send_message(chat_id, "🔕 Автообновление выключено.")
-        log_user_action(c.from_user, "выключил автообновление")
+        log_user_action(c.from_user, "выключил автообновление (inline)")
         return
+
+    now = now_msk()
 
     if data == "auto_1h":
         interval = AUTO_INTERVAL_1H
         label = "каждый 1 час"
+        last = now
     elif data == "auto_5h":
         interval = AUTO_INTERVAL_5H
         label = "каждые 5 часов"
+        last = now
     else:
         interval = AUTO_INTERVAL_24H
-    label = "каждые 24 часа"
+        label = "каждые 24 часа"
+        # старт в 08:00 МСК следующего дня
+        next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
+        if now.hour >= 8:
+            next_run += timedelta(days=1)
+        last = next_run - timedelta(seconds=interval)
 
-    # Устанавливаем старт в 08:00 МСК следующего дня
-    now = now_msk()
-    next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
-    if now.hour >= 8:
-        next_run += timedelta(days=1)
-
-    AUTO_USERS[chat_id] = {
-        "interval": interval,
-        "last": next_run - timedelta(seconds=interval)
-    }
-    
-    AUTO_USERS[chat_id] = {"interval": interval, "last": None}
+    AUTO_USERS[chat_id] = {"interval": interval, "last": last}
     bot.answer_callback_query(c.id, "Настройки сохранены")
     bot.send_message(chat_id, f"🔔 Автообновление включено: {label}.")
     log_user_action(c.from_user, f"включил автообновление ({label})")
 
+# ============== ПРОФИЛЬ ==============
 @bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
 def profile(m):
     ensure_keyboard(m)
@@ -467,18 +462,16 @@ def profile(m):
 # ============== АНТИ-СОН ДЛЯ RENDER ==============
 def keep_awake():
     """Автоматический пинг Render, чтобы бот не засыпал."""
-    url = "https://telegram-rate-bot-ooc6.onrender.com"  # <-- твой Render URL
+    url = "https://telegram-rate-bot-ooc6.onrender.com"  # твой Render URL
     while True:
         try:
             requests.get(url, timeout=5)
             print(f"[keep_alive] Pinged {url}")
         except Exception as e:
             print(f"[keep_alive] Ошибка пинга: {e}")
-        time.sleep(600)  # каждые 10 минут (600 сек)
+        time.sleep(600)  # каждые 10 минут
 
 # ============== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ==============
-from flask import Flask
-
 app = Flask(__name__)
 
 @app.route('/')
@@ -493,7 +486,6 @@ def run_web():
 
 # ============== ЗАПУСК ==============
 def main():
-    # фоновые потоки
     threading.Thread(target=auto_update_loop, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
     threading.Thread(target=run_web, daemon=True).start()
@@ -506,7 +498,6 @@ def main():
         try:
             bot.infinity_polling(skip_pending=True)
         except ApiTelegramException as e:
-            # конфликт getUpdates (кто-то ещё использует этот токен)
             if "Conflict: terminated by other getUpdates request" in str(e):
                 logger.error("⚠️ 409 Conflict от Telegram (другой getUpdates). Ждём 10 сек и пробуем заново.")
                 time.sleep(10)
@@ -519,14 +510,11 @@ def main():
 
 if __name__ == "__main__":
     try:
-        admin_id = ADMIN_LOG_CHAT_ID
         try:
-            bot.send_message(admin_id, "♻️ Бот успешно перезапущен и готов к работе!")
+            bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
         except Exception as e:
             print(f"Ошибка при отправке уведомления администратору: {e}")
-
         main()
-
     except Exception as e:
         logging.exception("❌ Фатальная ошибка при запуске бота")
         try:
