@@ -464,8 +464,9 @@ def home():
     return "Bot is running OK", 200
 
 def run_web():
-    """Фейковый веб-сервер для Render. ДОЛЖЕН слушать порт из переменной PORT."""
-    port = int(os.environ.get("PORT", 10000))
+    """Фейковый веб-сервер, чтобы Render не ругался на порты."""
+    import os
+    port = int(os.environ.get("PORT", 10000))  # <-- ключевое исправление
     print(f"[web] Using PORT={port}")
     app.run(host="0.0.0.0", port=port)
     
