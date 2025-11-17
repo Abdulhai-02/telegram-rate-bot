@@ -229,18 +229,18 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     text = (
         "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n\n"
 
-        "<b>USDT → KRW</b>\n"
+        "🇰🇷 <b>USDT → KRW</b>\n"
         f"• UPBIT:     <b>{upbit_txt}</b>\n"
         f"• BITHUMB:   <b>{bithumb_txt}</b>\n\n"
 
-        "<b>USDT → RUB (ABCEX)</b>\n"
+        "🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
         f"• Покупка:   <b>{ab_buy_txt}</b>\n"
         f"• Продажа:   <b>{ab_sell_txt}</b>\n\n"
 
-        "<b>KRW → RUB</b>\n"
-        f"• 1 000 000 ₩ = <b>{rub_txt}</b> (Google Finance)\n\n"
+        "💹 <b>KRW → RUB</b>\n"
+        f"• 1 000 000 ₩ = <b>{rub_txt}</b>\n\n"
 
-        f"🔁 <b>Данные обновлены {timestamp} (МСК)</b>\n\n"
+        f"⏱ <b>Обновлено: {timestamp} (МСК)</b>\n\n"
 
         "💰 <b>Обмен любых сумм и других валют — по предварительной договорённости.</b>\n\n"
         "📞 <b>Контакт для обмена:</b> @Abdulkhaiii"
@@ -257,7 +257,7 @@ def auto_update_loop():
         try:
             now = now_msk()
             # отправляем только с 08:00 до 23:00 МСК
-            if now.hour < 8 or now.hour >= 23:
+            if now.hour < 4 or now.hour >= 23:
                 continue
 
             with concurrent.futures.ThreadPoolExecutor() as ex:
@@ -300,13 +300,23 @@ def auto_update_loop():
 def main_keyboard():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(BTN_SHOW, BTN_AUTO)
-    m.row(BTN_PROFILE)
+    m.row(BTN_PROFILE, "🚫 Отключить уведомления")
     return m
 
 @bot.message_handler(commands=["start","help"])
 def start_handler(m):
     bot.send_message(m.chat.id, "👋 Привет!\n\nВыбери нужный раздел ниже 👇", reply_markup=main_keyboard())
     log_user_action(m.from_user, "нажал /start")
+    @bot.message_handler(func=lambda m: m.text == "🚫 Отключить уведомления")
+
+def disable_notifications(m):
+    chat_id = m.chat.id
+    if chat_id in AUTO_USERS:
+        AUTO_USERS.pop(chat_id, None)
+        bot.send_message(chat_id, "🔕 Уведомления отключены.")
+        log_user_action(m.from_user, "отключил уведомления")
+    else:
+        bot.send_message(chat_id, "Уведомления уже были выключены.")
 
 def ensure_keyboard(m):
     try:
@@ -414,8 +424,19 @@ def auto_callback(c):
         label = "каждые 5 часов"
     else:
         interval = AUTO_INTERVAL_24H
-        label = "каждые 24 часа"
+    label = "каждые 24 часа"
 
+    # Устанавливаем старт в 08:00 МСК следующего дня
+    now = now_msk()
+    next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now.hour >= 8:
+        next_run += timedelta(days=1)
+
+    AUTO_USERS[chat_id] = {
+        "interval": interval,
+        "last": next_run - timedelta(seconds=interval)
+    }
+    
     AUTO_USERS[chat_id] = {"interval": interval, "last": None}
     bot.answer_callback_query(c.id, "Настройки сохранены")
     bot.send_message(chat_id, f"🔔 Автообновление включено: {label}.")
