@@ -151,52 +151,62 @@ def get_krw_rub_from_google():
 
 def get_abcex_usdt_rub():
     """
-    Возвращает (buy_price, sell_price) для ABCEX USDT/RUB.
-    buy_price  = лучшая цена покупки USDT (bid)
-    sell_price = лучшая цена продажи USDT (ask)
+    Профессиональный высокоточный модуль получения курса ABCEX.
+    Возвращает (best_buy, best_sell):
+    - best_buy  → по сколько ABCEX покупает USDT (bid)
+    - best_sell → по сколько ABCEX продаёт USDT (ask)
     """
-    url = "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
-    params = {
-        "instrumentCode": "USDTRUB",
-        "lang": "ru"
-    }
 
+    url = "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
+    params = {"instrumentCode": "USDTRUB", "lang": "ru"}
+
+    # --- КЭШ 15 секунд для стабильности ---
     cache = getattr(get_abcex_usdt_rub, "_cache", None)
     last_time = getattr(get_abcex_usdt_rub, "_last", 0)
-
-    # немного кэша, чтобы не ддосить (20 секунд)
-    if cache and time.time() - last_time < 20:
+    if cache and time.time() - last_time < 15:
         return cache
 
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)",
             "Accept": "application/json",
-            "Origin": "https://abcex.io",
-            "Referer": "https://abcex.io/"
+            "Referer": "https://abcex.io/",
+            "Origin": "https://abcex.io"
         }
 
-        r = requests.get(url, params=params, headers=headers, timeout=5)
+        r = requests.get(url, params=params, headers=headers, timeout=4)
         r.raise_for_status()
         data = r.json()
 
-        bids = data.get("data", {}).get("bids", [])
-        asks = data.get("data", {}).get("asks", [])
+        # ABCEX отдаёт:
+        # "ask": [{"qty": "...", "price": "..."}]
+        # "bid": [{"qty": "...", "price": "..."}]
+        asks = data.get("ask")
+        bids = data.get("bid")
 
-        if not bids or not asks:
-            return (None, None)
+        if not asks or not bids:
+            raise ValueError("Пустой стакан ABCEX")
 
-        best_buy = float(bids[0][0])   # покупка USDT за RUB
-        best_sell = float(asks[0][0])  # продажа USDT за RUB
+        # Лучшая цена — всегда первый элемент
+        best_sell = float(asks[0]["price"])   # продажа USDT
+        best_buy  = float(bids[0]["price"])   # покупка USDT
 
         result = (best_buy, best_sell)
+
+        # сохраняем кэш
         get_abcex_usdt_rub._cache = result
         get_abcex_usdt_rub._last = time.time()
+
         return result
 
-    except Exception:
-        logger.exception("Ошибка получения ABCEX USDT/RUB")
-        return cache if cache else (None, None)
+    except Exception as e:
+        logger.error(f"Ошибка ABCEX: {e}")
+
+        # если ошибка — возвращаем последний рабочий результат
+        if cache:
+            return cache
+
+        return (None, None)
 
 # ============== ТЕКСТ КУРСА ==============
 def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
