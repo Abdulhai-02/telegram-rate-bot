@@ -210,40 +210,42 @@ def get_abcex_usdt_rub():
 
 # ============== ТЕКСТ КУРСА ==============
 def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
-    upbit_txt   = f"<b>{fmt_num(upbit, 0)} ₩</b>" if upbit else "<b>—</b>"
-    bithumb_txt = f"<b>{fmt_num(bithumb, 0)} ₩</b>" if bithumb else "<b>—</b>"
-    rub_txt     = f"<b>{fmt_num(rub, 2)} ₽</b>" if rub else "<b>—</b>"
+    upbit_txt   = f"{fmt_num(upbit, 0)} ₩" if upbit else "—"
+    bithumb_txt = f"{fmt_num(bithumb, 0)} ₩" if bithumb else "—"
+    rub_txt     = f"{fmt_num(rub, 2)} ₽" if rub else "—"
 
-    body = (
-        "💱 <b><u>АКТУАЛЬНЫЕ КУРСЫ</u></b>\n"
-        "──────────────────────\n"
-        f"🟢 <b>UPBIT</b>       1 USDT = {upbit_txt}\n"
-        f"🟡 <b>BITHUMB</b>  1 USDT = {bithumb_txt}\n"
-    )
+    if ab_buy:
+        ab_buy_txt = f"{fmt_num(ab_buy, 2)} ₽"
+    else:
+        ab_buy_txt = "—"
 
-    # блок ABCEX, если удалось взять курс
-    if ab_buy and ab_sell:
-        body += (
-            f"🟣 <b>ABCEX</b>\n"
-            f"   Покупка: <b>{fmt_num(ab_buy, 2)} ₽</b>\n"
-            f"   Продажа: <b>{fmt_num(ab_sell, 2)} ₽</b>\n"
-        )
-
-    body += (
-        "──────────────────────\n"
-        f"🇰🇷➡️🇷🇺   <b>1 000 000 ₩ ≈ {rub_txt}</b> (Google Finance)\n"
-        "──────────────────────\n"
-    )
+    if ab_sell:
+        ab_sell_txt = f"{fmt_num(ab_sell, 2)} ₽"
+    else:
+        ab_sell_txt = "—"
 
     timestamp = now_msk().strftime("%d.%m.%Y, %H:%M")
-    footer = f"🔁 <b>Данные обновлены {timestamp} (МСК)</b>\n\n"
 
-    contact = (
+    text = (
+        "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n\n"
+
+        "<b>USDT → KRW</b>\n"
+        f"• UPBIT:     <b>{upbit_txt}</b>\n"
+        f"• BITHUMB:   <b>{bithumb_txt}</b>\n\n"
+
+        "<b>USDT → RUB (ABCEX)</b>\n"
+        f"• Покупка:   <b>{ab_buy_txt}</b>\n"
+        f"• Продажа:   <b>{ab_sell_txt}</b>\n\n"
+
+        "<b>KRW → RUB</b>\n"
+        f"• 1 000 000 ₩ = <b>{rub_txt}</b> (Google Finance)\n\n"
+
+        f"🔁 <b>Данные обновлены {timestamp} (МСК)</b>\n\n"
+
         "💰 <b>Обмен любых сумм и других валют — по предварительной договорённости.</b>\n\n"
         "📞 <b>Контакт для обмена:</b> @Abdulkhaiii"
     )
-
-    return body + footer + contact
+    return text
 
 # ============== АВТООБНОВЛЕНИЕ ==============
 def auto_update_loop():
