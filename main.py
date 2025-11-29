@@ -500,9 +500,7 @@ def main():
             logger.exception("Ошибка в polling, пауза 15 сек")
             time.sleep(15)
 
-
-if __name__ == "__main__":
-    # ———— ОБНОВЛЕНИЕ КЛАВИАТУРЫ БЕЗ ЛОМАНИЯ ХЕНДЛЕРОВ ————
+# ———— ОБНОВЛЕНИЕ КЛАВИАТУРЫ БЕЗ ЛОМАНИЯ ХЕНДЛЕРОВ ————
 @bot.message_handler(func=lambda m: m.text not in [
     BTN_SHOW, BTN_AUTO, BTN_PROFILE, BTN_DISABLE, "/start", "/help"
 ])
@@ -512,6 +510,8 @@ def update_keyboard_global(m):
     Но кнопки и команды НЕ ПЕРЕХВАТЫВАЕМ.
     """
     ensure_keyboard(m)
+    
+if __name__ == "__main__":
     try:
         try:
             bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
