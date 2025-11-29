@@ -105,7 +105,8 @@ def get_bithumb_usdt_krw():
         return price
     except:
         return cache
-        def get_krw_rub_from_google():
+def get_krw_rub_from_google():    
+
     cache = getattr(get_krw_rub_from_google, "_cache", None)
     last = getattr(get_krw_rub_from_google, "_last", 0)
 
