@@ -284,11 +284,7 @@ def start_handler(m):
     log_user_action(m.from_user, "нажал /start")
 
 
-# ============== ОБНОВЛЕНИЕ КНОПОК ДЛЯ ВСЕХ ==============
-@bot.message_handler(func=lambda m: True)
-def update_keyboard_global(m):
-    """Каждое сообщение обновляет клавиатуру (старые пользователи получат новые кнопки)"""
-    ensure_keyboard(m)
+
 
 
 # ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ ==============
@@ -506,6 +502,16 @@ def main():
 
 
 if __name__ == "__main__":
+    # ———— ОБНОВЛЕНИЕ КЛАВИАТУРЫ БЕЗ ЛОМАНИЯ ХЕНДЛЕРОВ ————
+@bot.message_handler(func=lambda m: m.text not in [
+    BTN_SHOW, BTN_AUTO, BTN_PROFILE, BTN_DISABLE, "/start", "/help"
+])
+def update_keyboard_global(m):
+    """
+    Если пользователь пишет любое другое сообщение — обновляем клавиатуру.
+    Но кнопки и команды НЕ ПЕРЕХВАТЫВАЕМ.
+    """
+    ensure_keyboard(m)
     try:
         try:
             bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
