@@ -73,6 +73,7 @@ def human_interval(s):
     return f"каждые {s//3600} ч."
 
 # ============== API ==============
+
 def get_upbit_usdt_krw():
     cache = getattr(get_upbit_usdt_krw, "_cache", None)
     try:
@@ -104,8 +105,7 @@ def get_bithumb_usdt_krw():
         return price
     except:
         return cache
-
-def get_krw_rub_from_google():
+        def get_krw_rub_from_google():
     cache = getattr(get_krw_rub_from_google, "_cache", None)
     last = getattr(get_krw_rub_from_google, "_last", 0)
 
@@ -143,6 +143,7 @@ def get_krw_rub_from_google():
 
     return cache
 
+
 def get_abcex_usdt_rub():
     cache = getattr(get_abcex_usdt_rub, "_cache", None)
     last = getattr(get_abcex_usdt_rub, "_last", 0)
@@ -168,7 +169,9 @@ def get_abcex_usdt_rub():
         return result
     except:
         return cache or (None, None)
-        # ============== ТЕКСТ КУРСА ==============
+
+
+# ============== ТЕКСТ КУРСА ==============
 def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     upbit_txt   = f"{fmt_num(upbit, 0)} ₩" if upbit else "—"
     bithumb_txt = f"{fmt_num(bithumb, 0)} ₩" if bithumb else "—"
@@ -203,7 +206,7 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     return text
 
 
-# ============== АВТООБНОВЛЕНИЕ ==============
+# ============== АВТО-ОБНОВЛЕНИЕ ==============
 def auto_update_loop():
     while True:
         time.sleep(60)
@@ -252,9 +255,7 @@ def auto_update_loop():
 
         except Exception:
             logger.exception("Ошибка автообновления")
-
-
-# ============== КНОПКИ ==============
+            # ============== КНОПКИ ==============
 def main_keyboard():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(BTN_SHOW, BTN_AUTO)
@@ -262,8 +263,18 @@ def main_keyboard():
     return m
 
 
+def ensure_keyboard(m):
+    """Гарантированно отправляет новую клавиатуру старым пользователям"""
+    try:
+        bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
+    except:
+        pass
+
+
+# ============== /START ==============
 @bot.message_handler(commands=["start", "help"])
 def start_handler(m):
+    ensure_keyboard(m)
     bot.send_message(
         m.chat.id,
         "👋 Привет!\n\nВыбери нужный раздел ниже 👇",
@@ -272,14 +283,14 @@ def start_handler(m):
     log_user_action(m.from_user, "нажал /start")
 
 
-def ensure_keyboard(m):
-    try:
-        bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
-    except:
-        pass
+# ============== ОБНОВЛЕНИЕ КНОПОК ДЛЯ ВСЕХ ==============
+@bot.message_handler(func=lambda m: True)
+def update_keyboard_global(m):
+    """Каждое сообщение обновляет клавиатуру (старые пользователи получат новые кнопки)"""
+    ensure_keyboard(m)
 
 
-# ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ (КНОПКА) ==============
+# ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ ==============
 @bot.message_handler(func=lambda m: m.text == BTN_DISABLE)
 def disable_notifications(m):
     cid = m.chat.id
@@ -308,7 +319,7 @@ def show_rate(m):
         while stop["run"]:
             try:
                 bot.edit_message_text(
-                    f"⏳ Загрузка курса{dots[i%3]}...",
+                    f"⏳ Загрузка курса{dots[i % 3]}...",
                     cid, msg.message_id
                 )
             except:
@@ -335,7 +346,8 @@ def show_rate(m):
     if not any([u, b, r, ab_buy, ab_sell]):
         bot.edit_message_text(
             "⚠️ Не удалось получить курс.\nПопробуйте позже.",
-            cid, msg.message_id
+            cid,
+            msg.message_id
         )
         return
 
@@ -343,7 +355,8 @@ def show_rate(m):
 
     bot.edit_message_text(txt, cid, msg.message_id, parse_mode="HTML")
     update_user_stats(m.from_user)
-        log_to_channel(
+
+    log_to_channel(
         f"📊 Курс @{m.from_user.username or 'без_username'} ({m.from_user.id})\n"
         f"🕒 {now_msk().strftime('%H:%M:%S')} МСК\n"
         f"Upbit: {fmt_num(u, 0) if u else '—'} | "
@@ -354,7 +367,7 @@ def show_rate(m):
     )
 
 
-# ============== АВТООБНОВЛЕНИЕ НАСТРОЙКИ ==============
+# ============== АВТО-ОБНОВЛЕНИЕ НАСТРОЕК ==============
 @bot.message_handler(func=lambda m: m.text == BTN_AUTO)
 def toggle_auto(m):
     ensure_keyboard(m)
@@ -407,7 +420,6 @@ def auto_callback(c):
     else:
         interval = AUTO_INTERVAL_24H
         label = "каждые 24 часа"
-        # чтобы 24ч режим был привязан к 08:00 МСК
         next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
         if now.hour >= 8:
             next_run += timedelta(days=1)
@@ -455,7 +467,7 @@ def keep_awake():
         time.sleep(600)
 
 
-# ============== ФЕЙКОВЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ==============
+# ============== FAKE WEB SERVER ==============
 app = Flask(__name__)
 
 @app.route('/')
@@ -468,7 +480,7 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 
-# ============== ЗАПУСК ==============
+# ============== ЗАПУСК БОТА ==============
 def main():
     threading.Thread(target=auto_update_loop, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
@@ -481,14 +493,14 @@ def main():
         try:
             bot.infinity_polling(skip_pending=True)
         except ApiTelegramException as e:
-            if "Conflict: terminated by other getUpdates request" in str(e):
-                logger.error("⚠️ 409 Conflict от Telegram (другой getUpdates). Ждём 10 сек и пробуем заново.")
+            if "409" in str(e):
+                logger.error("⚠️ 409 Conflict, пробуем снова через 10 сек")
                 time.sleep(10)
                 continue
-            logger.exception("ApiTelegramException в polling, перезапуск через 15 сек")
+            logger.exception("ApiTelegramException, пауза 15 сек")
             time.sleep(15)
         except Exception:
-            logger.exception("Неожиданная ошибка в polling, перезапуск через 15 сек")
+            logger.exception("Ошибка в polling, пауза 15 сек")
             time.sleep(15)
 
 
@@ -497,11 +509,11 @@ if __name__ == "__main__":
         try:
             bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
         except Exception as e:
-            print(f"Ошибка при отправке уведомления администратору: {e}")
+            print(f"Ошибка отправки админу: {e}")
         main()
     except Exception as e:
-        logging.exception("❌ Фатальная ошибка при запуске бота")
+        logging.exception("❌ Фатальная ошибка")
         try:
-            bot.send_message(ADMIN_LOG_CHAT_ID, f"⚠️ Ошибка при запуске бота:\n{e}")
+            bot.send_message(ADMIN_LOG_CHAT_ID, f"⚠️ Ошибка запуска:\n{e}")
         except:
             pass
