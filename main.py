@@ -37,6 +37,7 @@ AUTO_INTERVAL_24H = 24 * 60 * 60
 
 AUTO_USERS = {}
 USER_STATS = defaultdict(lambda: {"requests": 0, "last": None})
+ALL_USERS = set()  # <--- Храним всех пользователей
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ def log_to_channel(text):
 def update_user_stats(user):
     USER_STATS[user.id]["requests"] += 1
     USER_STATS[user.id]["last"] = now_msk()
+
+def remember_user(user):
+    ALL_USERS.add(user.id)
 
 def log_user_action(user, action):
     try:
@@ -105,8 +109,8 @@ def get_bithumb_usdt_krw():
         return price
     except:
         return cache
-def get_krw_rub_from_google():    
 
+def get_krw_rub_from_google():
     cache = getattr(get_krw_rub_from_google, "_cache", None)
     last = getattr(get_krw_rub_from_google, "_last", 0)
 
@@ -144,7 +148,6 @@ def get_krw_rub_from_google():
 
     return cache
 
-
 def get_abcex_usdt_rub():
     cache = getattr(get_abcex_usdt_rub, "_cache", None)
     last = getattr(get_abcex_usdt_rub, "_last", 0)
@@ -171,7 +174,6 @@ def get_abcex_usdt_rub():
     except:
         return cache or (None, None)
 
-
 # ============== ТЕКСТ КУРСА ==============
 def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
     upbit_txt   = f"{fmt_num(upbit, 0)} ₩" if upbit else "—"
@@ -185,96 +187,40 @@ def build_rate_text(upbit, bithumb, rub, ab_buy=None, ab_sell=None):
 
     text = (
         "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n\n"
-
         "🇰🇷 <b>USDT → KRW</b>\n"
         f"◾ UPBIT:      <b>{upbit_txt}</b>\n"
         f"◾ BITHUMB:    <b>{bithumb_txt}</b>\n"
         "━━━━━━━━━━━━━━\n\n"
-
         "🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
         f"◾ Покупка:    <b>{ab_buy_txt}</b>\n"
         f"◾ Продажа:    <b>{ab_sell_txt}</b>\n"
         "━━━━━━━━━━━━━━\n\n"
-
         "🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
         f"◾ 1 000 000 ₩ → <b>{rub_txt}</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"⏱ Обновлено: <b>{timestamp} (МСК)</b>\n\n"
-
         "💰 Обмен любых сумм и валют — по договоренности.\n"
         "📞 Контакт: @Abdulkhaiii"
     )
     return text
 
-
-# ============== АВТО-ОБНОВЛЕНИЕ ==============
-def auto_update_loop():
-    while True:
-        time.sleep(60)
-        if not AUTO_USERS:
-            continue
-
-        try:
-            now = now_msk()
-            if now.hour < 8 or now.hour >= 23:
-                continue
-
-            with concurrent.futures.ThreadPoolExecutor() as ex:
-                fu_u = ex.submit(get_upbit_usdt_krw)
-                fu_b = ex.submit(get_bithumb_usdt_krw)
-                fu_r = ex.submit(get_krw_rub_from_google)
-                fu_ab = ex.submit(get_abcex_usdt_rub)
-
-                u = fu_u.result()
-                b = fu_b.result()
-                r = fu_r.result()
-                ab_buy, ab_sell = fu_ab.result()
-
-            if not any([u, b, r, ab_buy, ab_sell]):
-                continue
-
-            txt = build_rate_text(u, b, r, ab_buy, ab_sell)
-
-            for chat_id, cfg in list(AUTO_USERS.items()):
-                interval = cfg["interval"]
-                last = cfg["last"]
-
-                if last and (now - last).total_seconds() < interval:
-                    continue
-
-                try:
-                    bot.send_message(chat_id, txt)
-                    AUTO_USERS[chat_id]["last"] = now
-                except Exception as e:
-                    if "blocked" in str(e).lower():
-                        AUTO_USERS.pop(chat_id, None)
-
-            log_to_channel(
-                f"⏱ Автообновление ({len(AUTO_USERS)} пользователей) – "
-                f"{now.strftime('%H:%M:%S')}"
-            )
-
-        except Exception:
-            logger.exception("Ошибка автообновления")
-            # ============== КНОПКИ ==============
+# ============== КЛАВИАТУРА ==============
 def main_keyboard():
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.row(BTN_SHOW, BTN_AUTO)
     m.row(BTN_PROFILE, BTN_DISABLE)
     return m
 
-
 def ensure_keyboard(m):
-    """Гарантированно отправляет новую клавиатуру старым пользователям"""
     try:
         bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
     except:
         pass
 
-
-# ============== /START ==============
+# ============== START ==============
 @bot.message_handler(commands=["start", "help"])
 def start_handler(m):
+    remember_user(m.from_user)
     ensure_keyboard(m)
     bot.send_message(
         m.chat.id,
@@ -283,25 +229,10 @@ def start_handler(m):
     )
     log_user_action(m.from_user, "нажал /start")
 
-
-
-
-
-# ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ ==============
-@bot.message_handler(func=lambda m: m.text == BTN_DISABLE)
-def disable_notifications(m):
-    cid = m.chat.id
-    if cid in AUTO_USERS:
-        AUTO_USERS.pop(cid, None)
-        bot.send_message(cid, "🔕 Уведомления отключены.")
-        log_user_action(m.from_user, "отключил уведомления")
-    else:
-        bot.send_message(cid, "Уведомления уже выключены.")
-
-
 # ============== ПОКАЗ КУРСА ==============
 @bot.message_handler(func=lambda m: m.text == BTN_SHOW)
 def show_rate(m):
+    remember_user(m.from_user)
     ensure_keyboard(m)
     log_user_action(m.from_user, "нажал «Показать курс»")
     cid = m.chat.id
@@ -353,20 +284,10 @@ def show_rate(m):
     bot.edit_message_text(txt, cid, msg.message_id, parse_mode="HTML")
     update_user_stats(m.from_user)
 
-    log_to_channel(
-        f"📊 Курс @{m.from_user.username or 'без_username'} ({m.from_user.id})\n"
-        f"🕒 {now_msk().strftime('%H:%M:%S')} МСК\n"
-        f"Upbit: {fmt_num(u, 0) if u else '—'} | "
-        f"Bithumb: {fmt_num(b, 0) if b else '—'} | "
-        f"Google: {fmt_num(r, 2) if r else '—'} ₽ | "
-        f"ABCEX buy/sell: "
-        f"{fmt_num(ab_buy, 2) if ab_buy else '—'} / {fmt_num(ab_sell, 2) if ab_sell else '—'} ₽"
-    )
-
-
 # ============== АВТО-ОБНОВЛЕНИЕ НАСТРОЕК ==============
 @bot.message_handler(func=lambda m: m.text == BTN_AUTO)
 def toggle_auto(m):
+    remember_user(m.from_user)
     ensure_keyboard(m)
     cid = m.chat.id
 
@@ -391,26 +312,23 @@ def toggle_auto(m):
     bot.send_message(cid, text, reply_markup=kb)
     log_user_action(m.from_user, "открыл настройки автообновления")
 
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
 def auto_callback(c):
     cid = c.message.chat.id
-    data = c.data
 
-    if data == "auto_off":
+    if c.data == "auto_off":
         AUTO_USERS.pop(cid, None)
         bot.answer_callback_query(c.id, "Автообновление выключено")
         bot.send_message(cid, "🔕 Автообновление выключено.")
-        log_user_action(c.from_user, "выключил автообновление")
         return
 
     now = now_msk()
 
-    if data == "auto_1h":
+    if c.data == "auto_1h":
         interval = AUTO_INTERVAL_1H
         label = "каждый 1 час"
         last = now
-    elif data == "auto_5h":
+    elif c.data == "auto_5h":
         interval = AUTO_INTERVAL_5H
         label = "каждые 5 часов"
         last = now
@@ -425,21 +343,16 @@ def auto_callback(c):
     AUTO_USERS[cid] = {"interval": interval, "last": last}
     bot.answer_callback_query(c.id, "Настройки сохранены")
     bot.send_message(cid, f"🔔 Автообновление включено: {label}.")
-    log_user_action(c.from_user, f"включил автообновление ({label})")
-
 
 # ============== ПРОФИЛЬ ==============
 @bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
 def profile(m):
+    remember_user(m.from_user)
     ensure_keyboard(m)
     s = USER_STATS[m.from_user.id]
     last = s["last"].strftime("%d.%m.%Y %H:%M:%S") if s["last"] else "—"
 
-    if m.from_user.username:
-        nick = f"@{m.from_user.username}"
-    else:
-        full_name = " ".join(filter(None, [m.from_user.first_name, m.from_user.last_name]))
-        nick = full_name or "без имени"
+    nick = f"@{m.from_user.username}" if m.from_user.username else (m.from_user.first_name or "без имени")
 
     txt = (
         f"👤 <b>Профиль</b>\n\n"
@@ -449,20 +362,43 @@ def profile(m):
         f"Последний запрос: {last} (МСК)"
     )
     bot.send_message(m.chat.id, txt)
-    log_user_action(m.from_user, "открыл профиль")
 
+# ============== ОТКЛЮЧЕНИЕ УВЕДОМЛЕНИЙ ==============
+@bot.message_handler(func=lambda m: m.text == BTN_DISABLE)
+def disable_notifications(m):
+    remember_user(m.from_user)
+    cid = m.chat.id
 
-# ============== АНТИ-СОН ДЛЯ RENDER ==============
+    if cid in AUTO_USERS:
+        AUTO_USERS.pop(cid, None)
+        bot.send_message(cid, "🔕 Уведомления отключены.")
+    else:
+        bot.send_message(cid, "Уведомления уже выключены.")
+
+# ============== ОБНОВЛЕНИЕ КЛАВИАТУРЫ ДЛЯ ВСЕХ СООБЩЕНИЙ ==============
+@bot.message_handler(func=lambda m: (
+    m.text not in [
+        BTN_SHOW,
+        BTN_AUTO,
+        BTN_PROFILE,
+        BTN_DISABLE,
+        "/start",
+        "/help"
+    ]
+))
+def update_keyboard_global(m):
+    remember_user(m.from_user)
+    ensure_keyboard(m)
+
+# ============== АНТИ-СОН RENDER ==============
 def keep_awake():
     url = "https://telegram-rate-bot-ooc6.onrender.com"
     while True:
         try:
             requests.get(url, timeout=5)
-            print(f"[keep_alive] Pinged {url}")
-        except Exception as e:
-            print(f"[keep_alive] Ошибка пинга: {e}")
+        except:
+            pass
         time.sleep(600)
-
 
 # ============== FAKE WEB SERVER ==============
 app = Flask(__name__)
@@ -473,15 +409,23 @@ def home():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    print(f"[web] Using PORT={port}")
     app.run(host="0.0.0.0", port=port)
-
 
 # ============== ЗАПУСК БОТА ==============
 def main():
     threading.Thread(target=auto_update_loop, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
     threading.Thread(target=run_web, daemon=True).start()
+
+    # -------- Автоотправка обновлённой клавиатуры всем --------
+    def broadcast_new_keyboard():
+        for uid in list(ALL_USERS):
+            try:
+                bot.send_message(uid, "🔄 Меню обновлено:", reply_markup=main_keyboard())
+            except:
+                pass
+
+    broadcast_new_keyboard()
 
     logger.info("Бот запущен.")
     log_to_channel("🚀 Бот перезапущен и готов к работе")
@@ -500,27 +444,9 @@ def main():
             logger.exception("Ошибка в polling, пауза 15 сек")
             time.sleep(15)
 
-# ———— ОБНОВЛЕНИЕ КЛАВИАТУРЫ БЕЗ ЛОМАНИЯ ХЕНДЛЕРОВ ————
-@bot.message_handler(func=lambda m: m.text not in [
-    BTN_SHOW, BTN_AUTO, BTN_PROFILE, BTN_DISABLE, "/start", "/help"
-])
-def update_keyboard_global(m):
-    """
-    Если пользователь пишет любое другое сообщение — обновляем клавиатуру.
-    Но кнопки и команды НЕ ПЕРЕХВАТЫВАЕМ.
-    """
-    ensure_keyboard(m)
-
 if __name__ == "__main__":
     try:
-        try:
-            bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
-        except Exception as e:
-            print(f"Ошибка отправки админу: {e}")
-        main()
-    except Exception as e:
-        logging.exception("❌ Фатальная ошибка")
-        try:
-            bot.send_message(ADMIN_LOG_CHAT_ID, f"⚠️ Ошибка запуска:\n{e}")
-        except:
-            pass
+        bot.send_message(ADMIN_LOG_CHAT_ID, "♻️ Бот успешно перезапущен и готов к работе!")
+    except:
+        pass
+    main()
