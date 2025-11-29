@@ -23,7 +23,7 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# чат для логов (можно канал/чат, главное — ID)
+# чат для логов (канал/чат, главное — ID)
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -41,7 +41,7 @@ AUTO_INTERVAL_24H = 24 * 60 * 60
 # Память о пользователях
 AUTO_USERS = {}  # chat_id -> {"interval": int, "last": datetime}
 USER_STATS = defaultdict(lambda: {"requests": 0, "last": None})
-ALL_USERS = set()  # set(user_id)
+ALL_USERS = set()  # user_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,10 +71,23 @@ def remember_user(user) -> None:
     ALL_USERS.add(user.id)
 
 
+def pretty_name(user) -> str:
+    """Красивое имя пользователя для логов."""
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    parts = []
+    if getattr(user, "first_name", None):
+        parts.append(user.first_name)
+    if getattr(user, "last_name", None):
+        parts.append(user.last_name)
+    full = " ".join(parts)
+    return full or "пользователь без имени"
+
+
 def log_user_action(user, action: str) -> None:
     try:
         log_to_channel(
-            f"👤 @{user.username or 'без_username'} (ID {user.id})\n"
+            f"👤 {pretty_name(user)} (ID {user.id})\n"
             f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК\n➡️ {action}"
         )
     except Exception:
@@ -96,7 +109,6 @@ def human_interval(s: int) -> str:
 def get_upbit_usdt_krw():
     """
     Курс USDT/KRW на Upbit (через пару KRW-USDT).
-    Возвращает float или None (если не удалось).
     """
     cache = getattr(get_upbit_usdt_krw, "_cache", None)
     try:
@@ -139,7 +151,7 @@ def get_bithumb_usdt_krw():
 def get_krw_rub_from_google():
     """
     Возвращает, сколько РУБЛЕЙ за 1 000 000 KRW.
-    Сначала пытается Google Finance RUB/KRW, потом резервный open.er-api.
+    Сначала Google Finance RUB/KRW, потом резервный open.er-api.
     """
     cache = getattr(get_krw_rub_from_google, "_cache", None)
     last = getattr(get_krw_rub_from_google, "_last", 0)
@@ -319,7 +331,7 @@ def ensure_keyboard(m):
         pass
 
 
-# ============== ХЕНДЛЕРЫ ==============
+# ============== ХЕНдлеры ==============
 
 @bot.message_handler(commands=["start", "help"])
 def start_handler(m):
@@ -402,7 +414,7 @@ def show_rate(m):
 
     try:
         log_to_channel(
-            f"📊 Курс @{m.from_user.username or 'без_username'} ({m.from_user.id})\n"
+            f"📊 Курс {pretty_name(m.from_user)} (ID {m.from_user.id})\n"
             f"🕒 {now_msk().strftime('%H:%M:%S')} МСК\n"
             f"Upbit: {fmt_num(u, 0) if u else '—'} | "
             f"Bithumb: {fmt_num(b, 0) if b else '—'} | "
@@ -488,19 +500,13 @@ def profile(m):
     remember_user(m.from_user)
     ensure_keyboard(m)
     s = USER_STATS[m.from_user.id]
-    last = s["last"].strftime("%d.%m.%Y %H:%М:%S") if s["last"] else "—"
+    last = s["last"].strftime("%d.%m.%Y %H:%M:%S") if s["last"] else "—"
 
-    if m.from_user.username:
-        nick = f"@{m.from_user.username}"
-    else:
-        full_name = " ".join(
-            filter(None, [m.from_user.first_name, m.from_user.last_name])
-        )
-        nick = full_name or "без имени"
+    nick = pretty_name(m.from_user)
 
     txt = (
         f"👤 <b>Профиль</b>\n\n"
-        f"Ник: {nick}\n"
+        f"Имя: {nick}\n"
         f"ID: <code>{m.from_user.id}</code>\n\n"
         f"Запросов курса: {s['requests']}\n"
         f"Последний запрос: {last} (МСК)"
