@@ -488,7 +488,7 @@ def main():
 
     while True:
         try:
-            bot.infinity_polling(skip_pending=True)
+            bot.infinity_polling(skip_pending=False)
         except ApiTelegramException as e:
             if "409" in str(e):
                 logger.error("⚠️ 409 Conflict, пробуем снова через 10 сек")
@@ -510,7 +510,7 @@ def update_keyboard_global(m):
     Но кнопки и команды НЕ ПЕРЕХВАТЫВАЕМ.
     """
     ensure_keyboard(m)
-    
+
 if __name__ == "__main__":
     try:
         try:
