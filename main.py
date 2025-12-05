@@ -589,22 +589,22 @@ def main():
     log_to_channel("🚀 Бот перезапущен и готов к работе")
 
     while True:
-    try:
-        bot.infinity_polling(
-            skip_pending=False,
-            timeout=60,              # увеличиваем время ожидания
-            long_polling_timeout=60  # Telegram держит соединение дольше
-        )
-    except ApiTelegramException as e:
-        if "Conflict: terminated by other getUpdates request" in str(e):
-            logger.error("⚠️ 409 Conflict. Ждём 10 сек...")
-            time.sleep(10)
-            continue
-        logger.exception("ApiTelegramException в polling, пауза 15 сек")
-        time.sleep(15)
-    except Exception:
-        logger.exception("Неожиданная ошибка в polling, пауза 15 сек")
-        time.sleep(15)
+        try:
+            bot.infinity_polling(
+                skip_pending=False,
+                timeout=60,              # увеличиваем время ожидания
+                long_polling_timeout=60  # Telegram держит соединение дольше
+            )
+        except ApiTelegramException as e:
+            if "Conflict: terminated by other getUpdates request" in str(e):
+                logger.error("⚠️ 409 Conflict. Ждём 10 сек...")
+                time.sleep(10)
+                continue
+            logger.exception("ApiTelegramException в polling, пауза 15 сек")
+            time.sleep(15)
+        except Exception:
+            logger.exception("Неожиданная ошибка в polling, пауза 15 сек")
+            time.sleep(15)
 
 if __name__ == "__main__":
     try:
