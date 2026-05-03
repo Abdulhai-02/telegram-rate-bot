@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import logging
 import threading
 import time
 import concurrent.futures
@@ -12,616 +11,259 @@ from dotenv import load_dotenv
 import telebot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
-from bs4 import BeautifulSoup
 from flask import Flask
 
 # ============== НАСТРОЙКИ ==============
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_TOKEN в переменных окружения")
+    raise RuntimeError("Не задан TELEGRAM_TOKEN!")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# чат для логов (канал/чат, главное — ID)
-ADMIN_LOG_CHAT_ID = -1003264764082
+ADMIN_LOG_CHAT_ID = -1003264764082 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
-# Текст кнопок
-BTN_SHOW = "📊 Показать курс"
-BTN_AUTO = "🔔 Автообновление"
-BTN_PROFILE = "👤 Профиль"
-BTN_DISABLE = "🚫 Отключить уведомления"
+# Словари перевода (RU и EN)
+LANGS = {
+    'ru': {
+        'welcome': "👋 Выберите язык / Select language:",
+        'main_msg': "Главное меню:",
+        'rates': "📊 КУРСЫ",
+        'auto': "🔔 УВЕДОМЛЕНИЯ",
+        'feedback': "✍️ ОТЗЫВ",
+        'profile': "👤 АККАУНТ",
+        'loading': "⚡️ <i>Синхронизация с биржами...</i>",
+        'feedback_prompt': "Напишите ваш отзыв или предложение одним сообщением:",
+        'feedback_thanks': "✅ Спасибо! Ваш отзыв передан администратору.",
+        'rate_title': "МОНИТОРИНГ КУРСОВ",
+        'auto_menu': "Выберите частоту автоматических отчетов:",
+        'auto_off': "🔕 Уведомления отключены.",
+        'auto_on': "✅ Автообновление включено.",
+        'contact': "💳 Обмен: @Abdulkhaiii"
+    },
+    'en': {
+        'welcome': "👋 Select language:",
+        'main_msg': "Main Menu:",
+        'rates': "📊 RATES",
+        'auto': "🔔 ALERTS",
+        'feedback': "✍️ FEEDBACK",
+        'profile': "👤 PROFILE",
+        'loading': "⚡️ <i>Syncing with exchanges...</i>",
+        'feedback_prompt': "Write your feedback or suggestion in one message:",
+        'feedback_thanks': "✅ Thank you! Your feedback has been sent to the admin.",
+        'rate_title': "EXCHANGE RATES",
+        'auto_menu': "Select the frequency for automatic updates:",
+        'auto_off': "🔕 Alerts disabled.",
+        'auto_on': "✅ Auto-updates enabled.",
+        'contact': "💳 Exchange: @Abdulkhaiii"
+    }
+}
 
-# Интервалы автообновления
-AUTO_INTERVAL_1H = 60 * 60
-AUTO_INTERVAL_5H = 5 * 60 * 60
-AUTO_INTERVAL_24H = 24 * 60 * 60
+# Базы данных в памяти
+USER_DATA = defaultdict(lambda: {'lang': 'ru', 'requests': 0})
+AUTO_USERS = {}
 
-# Память о пользователях
-AUTO_USERS = {}  # chat_id -> {"interval": int, "last": datetime}
-USER_STATS = defaultdict(lambda: {"requests": 0, "last": None})
-ALL_USERS = set()  # user_id
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def now_msk() -> datetime:
+# ============== УТИЛИТЫ ==============
+def now_msk():
     return datetime.now(MOSCOW_TZ)
 
+def fmt_money(v, d=2):
+    if v is None: return "—"
+    return f"{v:,.{d}f}".replace(",", " ").replace(".", ",")
 
-def fmt_num(v, d: int = 2) -> str:
-    return f"{v:,.{d}f}".replace(",", " ")
-
-
-def log_to_channel(text: str) -> None:
+def log_event(user, action, is_important=False):
+    """Отправляет логи только о реальных действиях пользователей"""
     try:
+        prefix = "🔴 <b>ОТЗЫВ</b> 🔴\n" if is_important else "⚙️ Действие: "
+        text = (f"{prefix}<code>{action}</code>\n"
+                f"👤 <b>{user.first_name}</b> (@{user.username or 'id'+str(user.id)})\n"
+                f"🕒 {now_msk().strftime('%H:%M:%S')}")
         bot.send_message(ADMIN_LOG_CHAT_ID, text)
-    except Exception:
-        pass
-
-
-def update_user_stats(user) -> None:
-    USER_STATS[user.id]["requests"] += 1
-    USER_STATS[user.id]["last"] = now_msk()
-
-
-def remember_user(user) -> None:
-    ALL_USERS.add(user.id)
-
-
-def pretty_name(user) -> str:
-    """Красивое имя пользователя для логов."""
-    if getattr(user, "username", None):
-        return f"@{user.username}"
-    parts = []
-    if getattr(user, "first_name", None):
-        parts.append(user.first_name)
-    if getattr(user, "last_name", None):
-        parts.append(user.last_name)
-    full = " ".join(parts)
-    return full or "пользователь без имени"
-
-
-def log_user_action(user, action: str) -> None:
-    try:
-        log_to_channel(
-            f"👤 {pretty_name(user)} (ID {user.id})\n"
-            f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК\n➡️ {action}"
-        )
-    except Exception:
-        pass
-
-
-def human_interval(s: int) -> str:
-    if s == AUTO_INTERVAL_1H:
-        return "каждый 1 час"
-    if s == AUTO_INTERVAL_5H:
-        return "каждые 5 часов"
-    if s == AUTO_INTERVAL_24H:
-        return "каждые 24 часа"
-    return f"каждые {s // 3600} ч."
-
-
-# ============== API ==============
-
-def get_upbit_usdt_krw():
-    """
-    Курс USDT/KRW на Upbit (через пару KRW-USDT).
-    """
-    cache = getattr(get_upbit_usdt_krw, "_cache", None)
-    try:
-        r = requests.get(
-            "https://api.upbit.com/v1/ticker",
-            params={"markets": "KRW-USDT"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=4,
-        )
-        r.raise_for_status()
-        data = r.json()
-        price = float(data[0]["trade_price"])
-        get_upbit_usdt_krw._cache = price
-        return price
     except Exception as e:
-        logger.warning(f"Upbit error: {e}")
-        return cache
+        print(f"Ошибка логирования: {e}")
 
-
-def get_bithumb_usdt_krw():
-    """
-    Курс USDT/KRW на Bithumb.
-    """
-    cache = getattr(get_bithumb_usdt_krw, "_cache", None)
-    try:
-        r = requests.get(
-            "https://api.bithumb.com/public/ticker/USDT_KRW",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=4,
-        )
-        data = r.json()
-        price = float(data["data"]["closing_price"])
-        get_bithumb_usdt_krw._cache = price
-        return price
-    except Exception as e:
-        logger.warning(f"Bithumb error: {e}")
-        return cache
-
-
-def get_krw_rub_from_google():
-    """
-    Возвращает, сколько РУБЛЕЙ за 1 000 000 KRW.
-    Сначала Google Finance RUB/KRW, потом резервный open.er-api.
-    """
-    cache = getattr(get_krw_rub_from_google, "_cache", None)
-    last = getattr(get_krw_rub_from_google, "_last", 0)
-
-    # кэш 30 минут
-    if cache is not None and time.time() - last < 1800:
-        return cache
-
-    # Google Finance
-    try:
-        r = requests.get(
-            "https://www.google.com/finance/quote/RUB-KRW?hl=en",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
-        soup = BeautifulSoup(r.text, "html.parser")
-        div = soup.find("div", class_="YMlKec fxKbKc")
-        if div:
-            # значение KRW за 1 RUB
-            v = float(div.text.replace(",", "").replace("₩", ""))
-            # 1 RUB = v KRW => 1 KRW = 1/v RUB => 1e6 KRW = 1e6 * (1/v)
-            million_rub = 1_000_000 / v
-            get_krw_rub_from_google._cache = million_rub
-            get_krw_rub_from_google._last = time.time()
-            return million_rub
-    except Exception as e:
-        logger.warning(f"Google Finance error: {e}")
-
-    # Резервный API
-    try:
-        r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=5)
-        data = r.json()
-        if data.get("result") == "success" and "KRW" in data.get("rates", {}):
-            krw_per_rub = data["rates"]["KRW"]  # KRW за 1 RUB
-            # 1 RUB = krw_per_rub KRW => 1 KRW = 1/krw_per_rub RUB
-            million_rub = 1_000_000 / krw_per_rub
-            get_krw_rub_from_google._cache = million_rub
-            get_krw_rub_from_google._last = time.time()
-            return million_rub
-    except Exception as e:
-        logger.warning(f"open.er-api error: {e}")
-
-    return cache
-
-
-def get_abcex_usdt_rub():
-    """
-    Возвращает (best_buy, best_sell) для USDT/RUB на ABCEX.
-    """
-    cache = getattr(get_abcex_usdt_rub, "_cache", None)
-    last = getattr(get_abcex_usdt_rub, "_last", 0)
-
-    if cache is not None and time.time() - last < 15:
-        return cache
-
-    try:
-        r = requests.get(
-            "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth",
-            params={"instrumentCode": "USDTRUB", "lang": "ru"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=4,
-        )
-        data = r.json()
-        asks = data.get("ask") or []
-        bids = data.get("bid") or []
-        if not asks or not bids:
-            raise ValueError("Empty orderbook")
-
-        best_sell = float(asks[0]["price"])  # по чём продают USDT
-        best_buy = float(bids[0]["price"])   # по чём покупают USDT
-        result = (best_buy, best_sell)
-        get_abcex_usdt_rub._cache = result
-        get_abcex_usdt_rub._last = time.time()
-        return result
-    except Exception as e:
-        logger.warning(f"ABCEX error: {e}")
-        return cache or (None, None)
-
-
-# ============== ТЕКСТ КУРСА ==============
-
-def build_rate_text(upbit, bithumb, rub_mln, ab_buy=None, ab_sell=None) -> str:
-    upbit_txt = f"{fmt_num(upbit, 0)} ₩" if upbit else "—"
-    bithumb_txt = f"{fmt_num(bithumb, 0)} ₩" if bithumb else "—"
-    rub_txt = f"{fmt_num(rub_mln, 2)} ₽" if rub_mln else "—"
-
-    ab_buy_txt = f"{fmt_num(ab_buy, 2)} ₽" if ab_buy else "—"
-    ab_sell_txt = f"{fmt_num(ab_sell, 2)} ₽" if ab_sell else "—"
-
-    timestamp = now_msk().strftime("%d.%m.%Y, %H:%M")
-
-    text = (
-        "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>\n\n"
-        "🇰🇷 <b>USDT → KRW</b>\n"
-        f"◾ UPBIT:   <b>{upbit_txt}</b>\n"
-        f"◾ BITHUMB: <b>{bithumb_txt}</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
-        f"◾ Покупка: <b>{ab_buy_txt}</b>\n"
-        f"◾ Продажа: <b>{ab_sell_txt}</b>\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-        f"◾ 1 000 000 ₩ → <b>{rub_txt}</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"⏱ Обновлено: <b>{timestamp} (МСК)</b>\n\n"
-        "💰 Обмен любых сумм и валют — по договоренности.\n"
-        "📞 Контакт: @Abdulkhaiii"
-    )
-    return text
-
-
-# ============== АВТО-ОБНОВЛЕНИЕ ==============
-
-def auto_update_loop():
-    while True:
-        time.sleep(60)
-        if not AUTO_USERS:
-            continue
-
-        try:
-            now = now_msk()
-            # не спамим ночью
-            if now.hour < 8 or now.hour >= 23:
-                continue
-
-            with concurrent.futures.ThreadPoolExecutor() as ex:
-                fu_u = ex.submit(get_upbit_usdt_krw)
-                fu_b = ex.submit(get_bithumb_usdt_krw)
-                fu_r = ex.submit(get_krw_rub_from_google)
-                fu_ab = ex.submit(get_abcex_usdt_rub)
-
-                u = fu_u.result()
-                b = fu_b.result()
-                r = fu_r.result()
-                ab_buy, ab_sell = fu_ab.result()
-
-            if not any([u, b, r, ab_buy, ab_sell]):
-                continue
-
-            txt = build_rate_text(u, b, r, ab_buy, ab_sell)
-
-            for chat_id, cfg in list(AUTO_USERS.items()):
-                interval = cfg["interval"]
-                last = cfg["last"]
-
-                if last and (now - last).total_seconds() < interval:
-                    continue
-
-                try:
-                    bot.send_message(chat_id, txt)
-                    AUTO_USERS[chat_id]["last"] = now
-                except Exception as e:
-                    if "blocked" in str(e).lower():
-                        AUTO_USERS.pop(chat_id, None)
-
-            log_to_channel(
-                f"⏱ Автообновление ({len(AUTO_USERS)} пользователей) – "
-                f"{now.strftime('%H:%M:%S')}"
-            )
-        except Exception:
-            logger.exception("Ошибка автообновления")
-
-
-# ============== КЛАВИАТУРА ==============
-
-def main_keyboard():
-    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    m.row(BTN_SHOW, BTN_AUTO)
-    m.row(BTN_PROFILE, BTN_DISABLE)
+# ============== ИНТЕРФЕЙС ==============
+def lang_keyboard():
+    m = types.InlineKeyboardMarkup()
+    m.add(types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
+          types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"))
     return m
 
+def main_keyboard(uid):
+    l = USER_DATA[uid]['lang']
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(LANGS[l]['rates'], LANGS[l]['auto'])
+    m.add(LANGS[l]['feedback'], LANGS[l]['profile'])
+    return m
 
-def ensure_keyboard(m):
-    try:
-        bot.send_message(m.chat.id, " ", reply_markup=main_keyboard())
-    except Exception:
-        pass
+# ============== ПАРСИНГ API ==============
+class MarketAPI:
+    @staticmethod
+    def get_upbit():
+        try:
+            return float(requests.get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=4).json()[0]["trade_price"])
+        except: return None
 
+    @staticmethod
+    def get_bithumb():
+        try:
+            return float(requests.get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=4).json()["data"]["closing_price"])
+        except: return None
 
-# ============== ХЕНдлеры ==============
+    @staticmethod
+    def get_abcex():
+        try:
+            data = requests.get("https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB", timeout=4).json()
+            return float(data["bid"][0]["price"]), float(data["ask"][0]["price"])
+        except: return None, None
 
-@bot.message_handler(commands=["start", "help"])
-def start_handler(m):
-    remember_user(m.from_user)
-    ensure_keyboard(m)
-    bot.send_message(
-        m.chat.id,
-        "👋 Привет!\n\nВыбери нужный раздел ниже 👇",
-        reply_markup=main_keyboard()
-    )
-    log_user_action(m.from_user, "нажал /start")
+    @staticmethod
+    def get_krw_rub():
+        try:
+            r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=4).json()
+            return 1_000_000 / r["rates"]["KRW"]
+        except: return None
 
-
-@bot.message_handler(func=lambda m: m.text == BTN_DISABLE)
-def disable_notifications(m):
-    remember_user(m.from_user)
-    cid = m.chat.id
-    if cid in AUTO_USERS:
-        AUTO_USERS.pop(cid, None)
-        bot.send_message(cid, "🔕 Уведомления отключены.")
-        log_user_action(m.from_user, "отключил уведомления")
-    else:
-        bot.send_message(cid, "Уведомления уже выключены.")
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_SHOW)
-def show_rate(m):
-    remember_user(m.from_user)
-    ensure_keyboard(m)
-    log_user_action(m.from_user, "нажал «Показать курс»")
-    cid = m.chat.id
-
-    msg = bot.send_message(cid, "⏳ Загрузка курса, ожидайте...")
-
-    stop = {"run": True}
-
-    def anim():
-        dots = [".", "..", "..."]
-        i = 0
-        while stop["run"]:
-            try:
-                bot.edit_message_text(
-                    f"⏳ Загрузка курса{dots[i % 3]}...",
-                    cid,
-                    msg.message_id
-                )
-            except Exception:
-                break
-            i += 1
-            time.sleep(0.6)
-
-    threading.Thread(target=anim, daemon=True).start()
-
+def build_rate_msg(uid, is_auto=False):
+    l = USER_DATA[uid]['lang']
     with concurrent.futures.ThreadPoolExecutor() as ex:
-        fu_u = ex.submit(get_upbit_usdt_krw)
-        fu_b = ex.submit(get_bithumb_usdt_krw)
-        fu_r = ex.submit(get_krw_rub_from_google)
-        fu_ab = ex.submit(get_abcex_usdt_rub)
+        f_up = ex.submit(MarketAPI.get_upbit)
+        f_bi = ex.submit(MarketAPI.get_bithumb)
+        f_kr = ex.submit(MarketAPI.get_krw_rub)
+        f_ab = ex.submit(MarketAPI.get_abcex)
 
-        u = fu_u.result()
-        b = fu_b.result()
-        r = fu_r.result()
-        ab_buy, ab_sell = fu_ab.result()
+        u, bi, kr, (ab_b, ab_s) = f_up.result(), f_bi.result(), f_kr.result(), f_ab.result()
 
-    stop["run"] = False
-    time.sleep(0.4)
+    ts = now_msk().strftime("%H:%M:%S")
+    title = f"🔔 AUTO {LANGS[l]['rate_title']}" if is_auto else LANGS[l]['rate_title']
+    
+    msg = (
+        f"<b>{title}</b>\n"
+        f"<pre>Time: {ts} MSK</pre>\n\n"
+        f"🇰🇷 <b>USDT → KRW</b>\n"
+        f"├ Upbit:   <code>{fmt_money(u, 0)} ₩</code>\n"
+        f"└ Bithumb: <code>{fmt_money(bi, 0)} ₩</code>\n\n"
+        f"🇷🇺 <b>USDT → RUB (ABCEX)</b>\n"
+        f"├ Buy:  <code>{fmt_money(ab_b, 2)} ₽</code>\n"
+        f"└ Sell: <code>{fmt_money(ab_s, 2)} ₽</code>\n\n"
+        f"🔄 <b>KRW → RUB</b>\n"
+        f"└ 1 000 000 ₩ ≈ <code>{fmt_money(kr, 0)} ₽</code>\n\n"
+        f"<i>{LANGS[l]['contact']}</i>"
+    )
+    return msg
 
-    if not any([u, b, r, ab_buy, ab_sell]):
-        bot.edit_message_text(
-            "⚠️ Не удалось получить курс.\nПопробуйте позже.",
-            cid,
-            msg.message_id
-        )
-        return
+# ============== ОБРАБОТЧИКИ ==============
+@bot.message_handler(commands=['start'])
+def start_cmd(m):
+    bot.send_message(m.chat.id, LANGS['ru']['welcome'], reply_markup=lang_keyboard())
+    log_event(m.from_user, "запустил бота /start")
 
-    txt = build_rate_text(u, b, r, ab_buy, ab_sell)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("lang_"))
+def set_lang(c):
+    l = c.data.split("_")[1]
+    USER_DATA[c.from_user.id]['lang'] = l
+    bot.delete_message(c.message.chat.id, c.message.message_id)
+    bot.send_message(c.message.chat.id, LANGS[l]['main_msg'], reply_markup=main_keyboard(c.from_user.id))
+    log_event(c.from_user, f"выбрал язык: {l}")
 
-    bot.edit_message_text(txt, cid, msg.message_id, parse_mode="HTML")
-    update_user_stats(m.from_user)
-
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['rates'], LANGS['en']['rates']])
+def send_rates_cmd(m):
+    l = USER_DATA[m.from_user.id]['lang']
+    st = bot.send_message(m.chat.id, LANGS[l]['loading'])
     try:
-        log_to_channel(
-            f"📊 Курс {pretty_name(m.from_user)} (ID {m.from_user.id})\n"
-            f"🕒 {now_msk().strftime('%H:%M:%S')} МСК\n"
-            f"Upbit: {fmt_num(u, 0) if u else '—'} | "
-            f"Bithumb: {fmt_num(b, 0) if b else '—'} | "
-            f"KRW→RUB (1M): {fmt_num(r, 2) if r else '—'} ₽ | "
-            f"ABCEX buy/sell: "
-            f"{fmt_num(ab_buy, 2) if ab_buy else '—'} / {fmt_num(ab_sell, 2) if ab_sell else '—'} ₽"
-        )
-    except Exception:
-        pass
+        text = build_rate_msg(m.from_user.id)
+        bot.edit_message_text(text, m.chat.id, st.message_id)
+        USER_DATA[m.from_user.id]['requests'] += 1
+        log_event(m.from_user, "запросил курсы")
+    except Exception as e:
+        bot.edit_message_text("❌ Data fetch error / Ошибка получения данных", m.chat.id, st.message_id)
 
-
-@bot.message_handler(func=lambda m: m.text == BTN_AUTO)
-def toggle_auto(m):
-    remember_user(m.from_user)
-    ensure_keyboard(m)
-    cid = m.chat.id
-
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['auto'], LANGS['en']['auto']])
+def auto_settings(m):
+    l = USER_DATA[m.from_user.id]['lang']
     kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("⏱ Каждый 1 час", callback_data="auto_1h"),
-        types.InlineKeyboardButton("⏱ Каждые 5 часов", callback_data="auto_5h"),
-    )
-    kb.row(
-        types.InlineKeyboardButton(
-            "🕛 Раз в 24 часа (с 08:00 МСК)",
-            callback_data="auto_24h"
-        ),
-    )
-    if cid in AUTO_USERS:
-        kb.row(
-            types.InlineKeyboardButton(
-                "🔕 Выключить автообновление",
-                callback_data="auto_off"
-            )
-        )
+    kb.add(types.InlineKeyboardButton("1H / 1 Час", callback_data="set_3600"),
+           types.InlineKeyboardButton("5H / 5 Часов", callback_data="set_18000"))
+    kb.add(types.InlineKeyboardButton("24H / 24 Часа", callback_data="set_86400"))
+    kb.add(types.InlineKeyboardButton("🚫 OFF / Отключить", callback_data="set_0"))
+    
+    bot.send_message(m.chat.id, LANGS[l]['auto_menu'], reply_markup=kb)
 
-    text = "Выбери частоту автообновления курса:"
-    if cid in AUTO_USERS:
-        cur_int = AUTO_USERS[cid].get("interval", AUTO_INTERVAL_24H)
-        text += f"\nСейчас: {human_interval(cur_int)}."
-
-    bot.send_message(cid, text, reply_markup=kb)
-    log_user_action(m.from_user, "открыл настройки автообновления")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
-def auto_callback(c):
+@bot.callback_query_handler(func=lambda c: c.data.startswith("set_"))
+def handle_auto_set(c):
+    seconds = int(c.data.split("_")[1])
     cid = c.message.chat.id
-
-    if c.data == "auto_off":
+    l = USER_DATA[c.from_user.id]['lang']
+    
+    if seconds == 0:
         AUTO_USERS.pop(cid, None)
-        bot.answer_callback_query(c.id, "Автообновление выключено")
-        bot.send_message(cid, "🔕 Автообновление выключено.")
-        log_user_action(c.from_user, "выключил автообновление")
-        return
-
-    now = now_msk()
-
-    if c.data == "auto_1h":
-        interval = AUTO_INTERVAL_1H
-        label = "каждый 1 час"
-        last = now
-    elif c.data == "auto_5h":
-        interval = AUTO_INTERVAL_5H
-        label = "каждые 5 часов"
-        last = now
+        log_event(c.from_user, "отключил автоуведомления")
+        bot.edit_message_text(LANGS[l]['auto_off'], cid, c.message.message_id)
     else:
-        interval = AUTO_INTERVAL_24H
-        label = "каждые 24 часа"
-        next_run = now.replace(hour=8, minute=0, second=0, microsecond=0)
-        if now.hour >= 8:
-            next_run += timedelta(days=1)
-        last = next_run - timedelta(seconds=interval)
+        AUTO_USERS[cid] = {"interval": seconds, "last": now_msk()}
+        log_event(c.from_user, f"включил уведомления ({seconds//3600}ч)")
+        bot.edit_message_text(LANGS[l]['auto_on'], cid, c.message.message_id)
 
-    AUTO_USERS[cid] = {"interval": interval, "last": last}
-    bot.answer_callback_query(c.id, "Настройки сохранены")
-    bot.send_message(cid, f"🔔 Автообновление включено: {label}.")
-    log_user_action(c.from_user, f"включил автообновление ({label})")
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['feedback'], LANGS['en']['feedback']])
+def feedback_start(m):
+    l = USER_DATA[m.from_user.id]['lang']
+    msg = bot.send_message(m.chat.id, LANGS[l]['feedback_prompt'], reply_markup=types.ForceReply())
+    bot.register_next_step_handler(msg, feedback_save)
 
+def feedback_save(m):
+    l = USER_DATA[m.from_user.id]['lang']
+    if m.text:
+        log_event(m.from_user, m.text, is_important=True)
+        bot.send_message(m.chat.id, LANGS[l]['feedback_thanks'])
 
-@bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
-def profile(m):
-    remember_user(m.from_user)
-    ensure_keyboard(m)
-    s = USER_STATS[m.from_user.id]
-    last = s["last"].strftime("%d.%m.%Y %H:%M:%S") if s["last"] else "—"
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['profile'], LANGS['en']['profile']])
+def view_profile(m):
+    l = USER_DATA[m.from_user.id]['lang']
+    uid = m.from_user.id
+    msg = (f"{LANGS[l]['profile']}\n\n"
+           f"🆔 ID: <code>{uid}</code>\n"
+           f"📊 Requests: <b>{USER_DATA[uid]['requests']}</b>")
+    bot.send_message(m.chat.id, msg)
 
-    nick = pretty_name(m.from_user)
-
-    txt = (
-        f"👤 <b>Профиль</b>\n\n"
-        f"Имя: {nick}\n"
-        f"ID: <code>{m.from_user.id}</code>\n\n"
-        f"Запросов курса: {s['requests']}\n"
-        f"Последний запрос: {last} (МСК)"
-    )
-    bot.send_message(m.chat.id, txt)
-    log_user_action(m.from_user, "открыл профиль")
-
-
-@bot.message_handler(
-    func=lambda m: m.text not in [
-        BTN_SHOW,
-        BTN_AUTO,
-        BTN_PROFILE,
-        BTN_DISABLE,
-        "/start",
-        "/help",
-    ]
-)
-def update_keyboard_global(m):
-    """
-    Любое другое сообщение — просто обновляем клавиатуру,
-    чтобы старые пользователи получили новые кнопки.
-    """
-    remember_user(m.from_user)
-    ensure_keyboard(m)
-
-
-# ============== АНТИ-СОН ДЛЯ RENDER ==============
-
-def keep_awake():
-    url = "https://telegram-rate-bot-ooc6.onrender.com"
+# ============== ФОНОВЫЕ ПРОЦЕССЫ ==============
+def auto_worker():
+    """Рассылка по таймеру (АБСОЛЮТНО БЕЗ ЛОГИРОВАНИЯ В АДМИН ЧАТ)"""
     while True:
-        try:
-            requests.get(url, timeout=5)
-            print(f"[keep_alive] Pinged {url}")
-        except Exception as e:
-            print(f"[keep_alive] Ошибка пинга: {e}")
-        time.sleep(600)
+        time.sleep(60)
+        now = now_msk()
+        if now.hour >= 23 or now.hour < 8: continue # Пауза с 23:00 до 08:00 МСК
+        
+        for cid, data in list(AUTO_USERS.items()):
+            if (now - data['last']).total_seconds() >= data['interval']:
+                try:
+                    text = build_rate_msg(cid, is_auto=True)
+                    bot.send_message(cid, text)
+                    AUTO_USERS[cid]['last'] = now
+                except ApiTelegramException as e:
+                    if "blocked" in str(e).lower():
+                        AUTO_USERS.pop(cid, None)
+                except Exception:
+                    pass
 
-
-# ============== FAKE WEB SERVER ДЛЯ RENDER ==============
-
+# ============== ЗАПУСК СЕРВЕРА ==============
 app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    return "Bot is running OK", 200
-
-
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    print(f"[web] Using PORT={port}")
-    app.run(host="0.0.0.0", port=port)
-
-
-# ============== ЗАПУСК БОТА ==============
-
-def main():
-    # фоновые потоки
-    threading.Thread(target=auto_update_loop, daemon=True).start()
-    threading.Thread(target=keep_awake, daemon=True).start()
-    threading.Thread(target=run_web, daemon=True).start()
-
-    # при старте — мягко обновим клавиатуру у всех, кого помним
-    def broadcast_new_keyboard():
-        for uid in list(ALL_USERS):
-            try:
-                bot.send_message(
-                    uid,
-                    "🔄 Меню обновлено:",
-                    reply_markup=main_keyboard()
-                )
-            except Exception:
-                pass
-
-    broadcast_new_keyboard()
-
-    logger.info("Бот запущен.")
-    log_to_channel("🚀 Бот перезапущен и готов к работе")
-
-    while True:
-        try:
-            bot.infinity_polling(
-                skip_pending=False,
-                timeout=60,              # увеличиваем время ожидания
-                long_polling_timeout=60  # Telegram держит соединение дольше
-            )
-        except ApiTelegramException as e:
-            if "Conflict: terminated by other getUpdates request" in str(e):
-                logger.error("⚠️ 409 Conflict. Ждём 10 сек...")
-                time.sleep(10)
-                continue
-            logger.exception("ApiTelegramException в polling, пауза 15 сек")
-            time.sleep(15)
-        except Exception:
-            logger.exception("Неожиданная ошибка в polling, пауза 15 сек")
-            time.sleep(15)
+@app.route('/')
+def health_check(): return "P2P Bot is Active", 200
 
 if __name__ == "__main__":
-    try:
+    # 1. Запуск потока авто-рассылки
+    threading.Thread(target=auto_worker, daemon=True).start()
+    
+    # 2. Запуск фейкового веб-сервера (чтобы Render не глушил контейнер)
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    
+    print("🚀 P2P Бот успешно запущен!")
+    
+    # 3. Бесперебойный опрос Telegram (пропуск старых сообщений при рестарте)
+    while True:
         try:
-            bot.send_message(
-                ADMIN_LOG_CHAT_ID,
-                "♻️ Бот успешно перезапущен и готов к работе!"
-            )
+            bot.infinity_polling(skip_pending=True, timeout=60)
         except Exception as e:
-            print(f"Ошибка при отправке уведомления администратору: {e}")
-        main()
-    except Exception as e:
-        logging.exception("❌ Фатальная ошибка при запуске бота")
-        try:
-            bot.send_message(
-                ADMIN_LOG_CHAT_ID,
-                f"⚠️ Ошибка при запуске бота:\n{e}"
-            )
-        except Exception:
-            pass
+            print(f"Критическая ошибка Polling: {e}. Перезапуск через 5 сек...")
+            time.sleep(5)
