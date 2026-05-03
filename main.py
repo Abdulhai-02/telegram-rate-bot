@@ -22,8 +22,8 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ВАШ ID для доступа к админке
-MY_ADMIN_ID = 5266659205  
+# ВАШ ID (Обязательно проверьте его)
+MY_ADMIN_ID = 5266659205
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -47,19 +47,11 @@ LANGS = {
         'sell': "Продажа:",
         'updated': "⏱ Обновлено:",
         'contact': "💰 Обмен любых сумм и валют — по договоренности.\n📞 Контакт: @Abdulkhaiii",
-        'auto_menu': "Выбери частоту автообновления курса:",
-        'auto_1h': "каждый 1 час",
-        'auto_5h': "каждые 5 часов",
-        'auto_24h': "каждые 24 часа",
-        'auto_off_btn': "🔕 Выключить автообновление",
+        'auto_menu': "Выбери частоту автообновления:",
         'auto_off_msg': "🔕 Автообновление выключено.",
-        'auto_on_msg': "🔔 Автообновление включено:",
-        'prof_title': "👤 <b>Ваш Профиль</b>",
-        'prof_reqs': "Всего запросов курса:",
-        'prof_last': "Последний запрос:",
-        'prof_join': "В боте с:",
-        'feedback_prompt': "Напишите ваш отзыв или предложение:",
-        'feedback_thanks': "✅ Ваш отзыв передан администратору.",
+        'auto_on_msg': "🔔 Включено уведомление:",
+        'feedback_prompt': "Напишите ваш отзыв одним сообщением:",
+        'feedback_thanks': "✅ Спасибо! Ваш отзыв передан администратору.",
         'menu_updated': "🔄 Меню обновлено."
     },
     'en': {
@@ -80,24 +72,16 @@ LANGS = {
         'sell': "Sell:",
         'updated': "⏱ Updated:",
         'contact': "💰 Exchange of any amounts — by agreement.\n📞 Contact: @Abdulkhaiii",
+        'feedback_prompt': "Write your feedback in one message:",
+        'feedback_thanks': "✅ Thank you! Feedback sent to admin.",
         'auto_menu': "Select update frequency:",
-        'auto_1h': "every 1 hour",
-        'auto_5h': "every 5 hours",
-        'auto_24h': "every 24 hours",
-        'auto_off_btn': "🔕 Disable auto-updates",
         'auto_off_msg': "🔕 Auto-updates disabled.",
-        'auto_on_msg': "🔔 Auto-updates enabled:",
-        'prof_title': "👤 <b>Your Profile</b>",
-        'prof_reqs': "Total requests:",
-        'prof_last': "Last request:",
-        'prof_join': "Member since:",
-        'feedback_prompt': "Write your feedback or suggestion:",
-        'feedback_thanks': "✅ Feedback sent to admin.",
+        'auto_on_msg': "🔔 Alerts enabled:",
         'menu_updated': "🔄 Menu updated."
     }
 }
 
-# ============== БАЗА ДАННЫХ (ПАМЯТЬ) ==============
+# База данных
 USER_DATA = {}
 AUTO_USERS = {}
 ALL_USER_IDS = set() 
@@ -105,7 +89,7 @@ ALL_USER_IDS = set()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============== УТИЛИТЫ ==============
+# ============== УТИЛИТЫ И ЛОГИРОВАНИЕ ==============
 def now_msk(): return datetime.now(MOSCOW_TZ)
 
 def fmt_num(v, d=2):
@@ -125,7 +109,31 @@ def log_to_channel(text):
     try: bot.send_message(ADMIN_LOG_CHAT_ID, text, parse_mode="HTML")
     except: pass
 
-# ============== КЛАВИАТУРЫ ==============
+def log_action(user, action, result=None):
+    """Единая и аккуратная функция для отправки логов в админ-канал"""
+    try:
+        name = user.first_name
+        if user.last_name: name += f" {user.last_name}"
+        nick = f"@{user.username}" if user.username else "Нет ника"
+        time_str = now_msk().strftime('%H:%M:%S')
+
+        log_text = (
+            f"⚙️ <b>Лог действия</b>\n"
+            f"👤 Имя: {name}\n"
+            f"🔗 Ник / ID: {nick} | <code>{user.id}</code>\n"
+            f"🔘 Кнопка: <b>{action}</b>\n"
+        )
+        
+        if result:
+            log_text += f"📊 Результат: {result}\n"
+            
+        log_text += f"🕒 Время: {time_str} МСК"
+        
+        bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка отправки лога: {e}")
+
+# ============== UI ==============
 def main_keyboard(uid):
     l = USER_DATA.get(uid, {}).get("lang", "ru")
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -137,23 +145,23 @@ def main_keyboard(uid):
 
 # ============== API ==============
 def fetch_all_rates():
-    def get_u():
+    def g_u():
         try: return float(requests.get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=4).json()[0]["trade_price"])
         except: return None
-    def get_b():
+    def g_b():
         try: return float(requests.get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=4).json()["data"]["closing_price"])
         except: return None
-    def get_r():
+    def g_r():
         try: return 1_000_000 / requests.get("https://open.er-api.com/v6/latest/RUB", timeout=5).json()["rates"]["KRW"]
         except: return None
-    def get_ab():
+    def g_ab():
         try:
             d = requests.get("https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB", timeout=4).json()
             return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
         except: return None, None
 
     with concurrent.futures.ThreadPoolExecutor() as ex:
-        return ex.submit(get_u).result(), ex.submit(get_b).result(), ex.submit(get_r).result(), ex.submit(get_ab).result()
+        return ex.submit(g_u).result(), ex.submit(g_b).result(), ex.submit(g_r).result(), ex.submit(g_ab).result()
 
 # ============== ОБРАБОТЧИКИ ==============
 @bot.message_handler(commands=["start"])
@@ -163,6 +171,7 @@ def start_handler(m):
     kb.add(types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
            types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"))
     bot.send_message(m.chat.id, "🇷🇺 Выберите язык / 🇬🇧 Select language:", reply_markup=kb)
+    log_action(m.from_user, "Команда /start")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lang_"))
 def lang_set(c):
@@ -171,6 +180,7 @@ def lang_set(c):
     USER_DATA[c.from_user.id]['lang'] = l
     bot.delete_message(c.message.chat.id, c.message.message_id)
     bot.send_message(c.message.chat.id, LANGS[l]['welcome'], reply_markup=main_keyboard(c.from_user.id))
+    log_action(c.from_user, f"Выбор языка ({'Русский' if l == 'ru' else 'English'})")
 
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_show'], LANGS['en']['btn_show']])
 def show_rate(m):
@@ -182,6 +192,7 @@ def show_rate(m):
     
     if not any([u, b, r, ab_buy]):
         bot.edit_message_text(LANGS[l]['error_fetch'], m.chat.id, msg.message_id)
+        log_action(m.from_user, "Показать курс", result="⚠️ Ошибка API (Биржи не ответили)")
         return
 
     timestamp = now_msk().strftime("%d.%m.%Y, %H:%M")
@@ -194,7 +205,10 @@ def show_rate(m):
     )
     bot.edit_message_text(text, m.chat.id, msg.message_id, parse_mode="HTML")
     
-    log_to_channel(f"📊 <b>Курс:</b> @{m.from_user.username or 'ID'+str(m.from_user.id)}\n📈 Upbit: {fmt_num(u,0)} | ABCEX: {fmt_num(ab_buy,2)}")
+    # Отправка подробного лога с результатами
+    res_log = f"Upbit {fmt_num(u,0)} ₩ | ABCEX Buy {fmt_num(ab_buy,2)} ₽"
+    log_action(m.from_user, "Показать курс", result=res_log)
+    
     USER_DATA[m.from_user.id]["requests"] += 1
     USER_DATA[m.from_user.id]["last"] = now_msk()
 
@@ -218,18 +232,33 @@ def show_profile(m):
         f"<b>{LANGS[l]['prof_last']}</b> {last}"
     )
     bot.send_message(m.chat.id, txt, parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
+    log_action(m.from_user, "Профиль")
 
+# --- ОТЗЫВ ---
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_feedback'], LANGS['en']['btn_feedback']])
 def feedback_start(m):
     init_user(m.from_user)
     l = USER_DATA[m.from_user.id]['lang']
     msg = bot.send_message(m.chat.id, LANGS[l]['feedback_prompt'], reply_markup=types.ForceReply())
     bot.register_next_step_handler(msg, feedback_save)
+    log_action(m.from_user, "Нажал кнопку 'Отзыв'")
 
 def feedback_save(m):
     l = USER_DATA[m.from_user.id]['lang']
     if m.text:
-        log_to_channel(f"🔴 <b>ОТЗЫВ</b>\n👤 @{m.from_user.username or m.from_user.id}\n💬 {m.text}")
+        name = m.from_user.first_name
+        nick = f"@{m.from_user.username}" if m.from_user.username else "Нет ника"
+        time_str = now_msk().strftime('%H:%M:%S')
+        
+        # Специальный яркий лог для отзывов
+        log_text = (
+            f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
+            f"👤 Имя: {name}\n"
+            f"🔗 Ник / ID: {nick} | <code>{m.from_user.id}</code>\n"
+            f"💬 Текст: <i>{m.text}</i>\n"
+            f"🕒 Время: {time_str} МСК"
+        )
+        bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
         bot.send_message(m.chat.id, LANGS[l]['feedback_thanks'], reply_markup=main_keyboard(m.from_user.id))
 
 # ============== АДМИНКА ==============
@@ -244,6 +273,7 @@ def admin_panel(m):
         types.InlineKeyboardButton("✉️ Сообщение юзеру", callback_data="adm_pm")
     )
     bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=kb)
+    log_action(m.from_user, "Открыл Админ-панель")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm_"))
 def admin_cb(c):
@@ -280,6 +310,7 @@ def do_bc(m):
             count += 1
         except: pass
     bot.send_message(m.chat.id, f"✅ Отправлено {count} чел.")
+    log_action(m.from_user, "Рассылка всем", result=f"Успешно для {count} чел.")
 
 def do_pm_id(m):
     try:
@@ -292,9 +323,12 @@ def do_pm_send(m, tid):
     try:
         bot.send_message(tid, f"✉️ <b>СООБЩЕНИЕ ОТ АДМИНА:</b>\n\n{m.text}")
         bot.send_message(m.chat.id, "✅ Доставлено.")
-    except: bot.send_message(m.chat.id, "❌ Ошибка отправки.")
+        log_action(m.from_user, f"Личное сообщение ID {tid}", result="Доставлено")
+    except: 
+        bot.send_message(m.chat.id, "❌ Ошибка отправки.")
+        log_action(m.from_user, f"Личное сообщение ID {tid}", result="Ошибка отправки")
 
-# ============== ПРОЧЕЕ ==============
+# ============== НАСТРОЙКА УВЕДОМЛЕНИЙ ==============
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_auto'], LANGS['en']['btn_auto']])
 def toggle_auto(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
@@ -304,6 +338,7 @@ def toggle_auto(m):
            types.InlineKeyboardButton("24H", callback_data="auto_86400"))
     if m.chat.id in AUTO_USERS: kb.row(types.InlineKeyboardButton("🚫 OFF", callback_data="auto_0"))
     bot.send_message(m.chat.id, LANGS[l]['auto_menu'], reply_markup=kb)
+    log_action(m.from_user, "Открыл меню Автообновления")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
 def auto_callback(c):
@@ -312,16 +347,18 @@ def auto_callback(c):
     if val == 0:
         AUTO_USERS.pop(c.message.chat.id, None)
         bot.edit_message_text(LANGS[l]['auto_off_msg'], c.message.chat.id, c.message.message_id)
+        log_action(c.from_user, "Автообновление", result="Отключено")
     else:
         AUTO_USERS[c.message.chat.id] = {"interval": val, "last": now_msk()}
         bot.edit_message_text(f"{LANGS[l]['auto_on_msg']} {val//3600}H.", c.message.chat.id, c.message.message_id)
+        log_action(c.from_user, "Автообновление", result=f"Включено на {val//3600} ч.")
 
 @bot.message_handler(func=lambda m: True)
 def auto_update_kb(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
     bot.send_message(m.chat.id, LANGS[l]['menu_updated'], reply_markup=main_keyboard(m.from_user.id))
 
-# ============== ЗАПУСК ==============
+# ============== ФОН И ЗАПУСК ==============
 app = Flask(__name__)
 @app.route('/')
 def home(): return "OK", 200
