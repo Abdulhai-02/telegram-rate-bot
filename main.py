@@ -105,12 +105,7 @@ def init_user(user):
             "joined": now_msk(), "first_name": user.first_name, "username": user.username
         }
 
-def log_to_channel(text):
-    try: bot.send_message(ADMIN_LOG_CHAT_ID, text, parse_mode="HTML")
-    except: pass
-
 def log_action(user, action, result=None):
-    """Единая и аккуратная функция для отправки логов в админ-канал"""
     try:
         name = user.first_name
         if user.last_name: name += f" {user.last_name}"
@@ -128,7 +123,6 @@ def log_action(user, action, result=None):
             log_text += f"📊 Результат: {result}\n"
             
         log_text += f"🕒 Время: {time_str} МСК"
-        
         bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка отправки лога: {e}")
@@ -205,7 +199,6 @@ def show_rate(m):
     )
     bot.edit_message_text(text, m.chat.id, msg.message_id, parse_mode="HTML")
     
-    # Отправка подробного лога с результатами
     res_log = f"Upbit {fmt_num(u,0)} ₩ | ABCEX Buy {fmt_num(ab_buy,2)} ₽"
     log_action(m.from_user, "Показать курс", result=res_log)
     
@@ -250,7 +243,6 @@ def feedback_save(m):
         nick = f"@{m.from_user.username}" if m.from_user.username else "Нет ника"
         time_str = now_msk().strftime('%H:%M:%S')
         
-        # Специальный яркий лог для отзывов
         log_text = (
             f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
             f"👤 Имя: {name}\n"
@@ -353,15 +345,30 @@ def auto_callback(c):
         bot.edit_message_text(f"{LANGS[l]['auto_on_msg']} {val//3600}H.", c.message.chat.id, c.message.message_id)
         log_action(c.from_user, "Автообновление", result=f"Включено на {val//3600} ч.")
 
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_disable'], LANGS['en']['btn_disable']])
+def disable_notifications(m):
+    init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
+    if m.chat.id in AUTO_USERS:
+        AUTO_USERS.pop(m.chat.id, None)
+        bot.send_message(m.chat.id, LANGS[l]['auto_off_msg'])
+        log_action(m.from_user, "Отключил уведомления через меню")
+
 @bot.message_handler(func=lambda m: True)
 def auto_update_kb(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
     bot.send_message(m.chat.id, LANGS[l]['menu_updated'], reply_markup=main_keyboard(m.from_user.id))
 
 # ============== ФОН И ЗАПУСК ==============
-app = Flask(__name__)
-@app.route('/')
-def home(): return "OK", 200
+def keep_awake():
+    """АНТИСПЯЧКА ДЛЯ RENDER"""
+    url = "https://telegram-rate-bot-ooc6.onrender.com"
+    while True:
+        try:
+            requests.get(url, timeout=5)
+            logger.info("Пинг антиспячки отправлен")
+        except Exception as e:
+            logger.error(f"Ошибка антиспячки: {e}")
+        time.sleep(600)  # Каждые 10 минут
 
 def auto_worker():
     while True:
@@ -372,13 +379,21 @@ def auto_worker():
                 try:
                     u, b, r, (ab_b, ab_s) = fetch_all_rates()
                     l = USER_DATA.get(cid, {}).get("lang", "ru")
-                    bot.send_message(cid, f"🔔 <b>AUTO:</b> {fmt_num(u,0)} ₩ | {fmt_num(ab_b,2)} ₽")
+                    bot.send_message(cid, f"🔔 <b>AUTO:</b> {fmt_num(u,0)} ₩ | {fmt_num(ab_b,2)} ₽", parse_mode="HTML")
                     AUTO_USERS[cid]["last"] = now
-                except: pass
+                except Exception as e:
+                    if "blocked" in str(e).lower():
+                        AUTO_USERS.pop(cid, None)
+
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Бот работает и не спит!", 200
 
 if __name__ == "__main__":
     threading.Thread(target=auto_worker, daemon=True).start()
+    threading.Thread(target=keep_awake, daemon=True).start() # Включена антиспячка
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    
     while True:
         try: bot.infinity_polling(skip_pending=True)
-        except: time.sleep(5)
+        except Exception as e: time.sleep(5)
