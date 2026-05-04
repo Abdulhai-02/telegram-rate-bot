@@ -22,10 +22,12 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
+# ВАШ ID (Обязательно проверьте его)
 MY_ADMIN_ID = 5266659205
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
+# ============== ЛОКАЛИЗАЦИЯ ==============
 LANGS = {
     'ru': {
         'btn_show': "📊 Показать курс",
@@ -50,7 +52,11 @@ LANGS = {
         'auto_on_msg': "🔔 Включено уведомление:",
         'feedback_prompt': "Напишите ваш отзыв одним сообщением:",
         'feedback_thanks': "✅ Спасибо! Ваш отзыв передан администратору.",
-        'menu_updated': "🔄 Меню обновлено."
+        'menu_updated': "🔄 Меню обновлено.",
+        'prof_title': "👤 <b>Ваш Профиль</b>",
+        'prof_reqs': "Всего запросов курса:",
+        'prof_last': "Последний запрос:",
+        'prof_join': "В боте с:"
     },
     'en': {
         'btn_show': "📊 Show Rates",
@@ -75,7 +81,11 @@ LANGS = {
         'auto_menu': "Select update frequency:",
         'auto_off_msg': "🔕 Auto-updates disabled.",
         'auto_on_msg': "🔔 Alerts enabled:",
-        'menu_updated': "🔄 Menu updated."
+        'menu_updated': "🔄 Menu updated.",
+        'prof_title': "👤 <b>Your Profile</b>",
+        'prof_reqs': "Total requests:",
+        'prof_last': "Last request:",
+        'prof_join': "Member since:"
     }
 }
 
@@ -236,6 +246,7 @@ def feedback_save(m):
     l = USER_DATA[m.from_user.id]['lang']
     if m.text:
         name = m.from_user.first_name
+        if m.from_user.last_name: name += f" {m.from_user.last_name}"
         nick = f"@{m.from_user.username}" if m.from_user.username else "Нет"
         log_text = (
             f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
@@ -268,12 +279,12 @@ def admin_cb(c):
     
     if action == "stat":
         reqs = sum(u['requests'] for u in USER_DATA.values())
-        txt = f"📊 <b>Статистика</b>\n\nЮзеров: {len(ALL_USER_IDS)}\nАвтообновлений: {len(AUTO_USERS)}\nВсего запросов: {reqs}"
+        txt = f"📊 <b>Статистика</b>\n\nЮзеров в сессии: {len(ALL_USER_IDS)}\nАктивных подписок: {len(AUTO_USERS)}\nВсего запросов: {reqs}"
         bot.answer_callback_query(c.id)
         bot.send_message(c.message.chat.id, txt)
         
     elif action == "users":
-        txt = "👥 <b>Пользователи:</b>\n\n"
+        txt = "👥 <b>Пользователи за сессию:</b>\n\n"
         for uid, d in USER_DATA.items():
             nick = f"@{d['username']}" if d['username'] else d['first_name']
             txt += f"• <code>{uid}</code> | {nick}\n"
@@ -313,7 +324,7 @@ def do_pm_send(m, tid):
     except: 
         bot.send_message(m.chat.id, "❌ Ошибка отправки.")
 
-# ============== УВЕДОМЛЕНИЯ ==============
+# ============== НАСТРОЙКА УВЕДОМЛЕНИЙ ==============
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_auto'], LANGS['en']['btn_auto']])
 def toggle_auto(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
@@ -323,6 +334,7 @@ def toggle_auto(m):
            types.InlineKeyboardButton("24H", callback_data="auto_86400"))
     if m.chat.id in AUTO_USERS: kb.row(types.InlineKeyboardButton("🚫 OFF", callback_data="auto_0"))
     bot.send_message(m.chat.id, LANGS[l]['auto_menu'], reply_markup=kb)
+    log_action(m.from_user, "Открыл меню Автообновления")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
 def auto_callback(c):
@@ -336,6 +348,14 @@ def auto_callback(c):
         AUTO_USERS[c.message.chat.id] = {"interval": val, "last": now_msk()}
         bot.edit_message_text(f"{LANGS[l]['auto_on_msg']} {val//3600}H.", c.message.chat.id, c.message.message_id)
         log_action(c.from_user, "Автообновление", result=f"Включено ({val//3600}H)")
+
+@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_disable'], LANGS['en']['btn_disable']])
+def disable_notifications(m):
+    init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
+    if m.chat.id in AUTO_USERS:
+        AUTO_USERS.pop(m.chat.id, None)
+        bot.send_message(m.chat.id, LANGS[l]['auto_off_msg'])
+        log_action(m.from_user, "Отключил уведомления через меню")
 
 @bot.message_handler(func=lambda m: True)
 def auto_update_kb(m):
@@ -365,7 +385,7 @@ def auto_worker():
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "OK", 200
+def home(): return "Бот работает и не спит!", 200
 
 if __name__ == "__main__":
     # Исправление возможного конфликта вебхуков (гарантирует запуск)
@@ -385,7 +405,7 @@ if __name__ == "__main__":
     logger.info("Бот запущен...")
     while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=60, request_timeout=60)
+            bot.infinity_polling(skip_pending=True, timeout=60)
         except ApiTelegramException as e:
             logger.error(f"Ошибка API: {e}")
             time.sleep(10)
