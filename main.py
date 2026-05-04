@@ -22,12 +22,10 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ВАШ ID (Обязательно проверьте его)
 MY_ADMIN_ID = 5266659205
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
-# ============== ЛОКАЛИЗАЦИЯ ==============
 LANGS = {
     'ru': {
         'btn_show': "📊 Показать курс",
@@ -81,7 +79,6 @@ LANGS = {
     }
 }
 
-# База данных
 USER_DATA = {}
 AUTO_USERS = {}
 ALL_USER_IDS = set() 
@@ -118,11 +115,9 @@ def log_action(user, action, result=None):
             f"🔗 Ник / ID: {nick} | <code>{user.id}</code>\n"
             f"🔘 Кнопка: <b>{action}</b>\n"
         )
-        
-        if result:
-            log_text += f"📊 Результат: {result}\n"
-            
+        if result: log_text += f"📊 Результат: {result}\n"
         log_text += f"🕒 Время: {time_str} МСК"
+        
         bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка отправки лога: {e}")
@@ -137,20 +132,22 @@ def main_keyboard(uid):
     if uid == MY_ADMIN_ID: m.row(LANGS[l]['btn_admin'])
     return m
 
-# ============== API ==============
+# ============== API (ИСпРАВЛЕНО: Добавлены заголовки) ==============
 def fetch_all_rates():
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
     def g_u():
-        try: return float(requests.get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=4).json()[0]["trade_price"])
+        try: return float(requests.get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", headers=headers, timeout=5).json()[0]["trade_price"])
         except: return None
     def g_b():
-        try: return float(requests.get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=4).json()["data"]["closing_price"])
+        try: return float(requests.get("https://api.bithumb.com/public/ticker/USDT_KRW", headers=headers, timeout=5).json()["data"]["closing_price"])
         except: return None
     def g_r():
         try: return 1_000_000 / requests.get("https://open.er-api.com/v6/latest/RUB", timeout=5).json()["rates"]["KRW"]
         except: return None
     def g_ab():
         try:
-            d = requests.get("https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB", timeout=4).json()
+            d = requests.get("https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB", headers=headers, timeout=5).json()
             return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
         except: return None, None
 
@@ -186,7 +183,7 @@ def show_rate(m):
     
     if not any([u, b, r, ab_buy]):
         bot.edit_message_text(LANGS[l]['error_fetch'], m.chat.id, msg.message_id)
-        log_action(m.from_user, "Показать курс", result="⚠️ Ошибка API (Биржи не ответили)")
+        log_action(m.from_user, "Показать курс", result="⚠️ Ошибка API")
         return
 
     timestamp = now_msk().strftime("%d.%m.%Y, %H:%M")
@@ -199,7 +196,7 @@ def show_rate(m):
     )
     bot.edit_message_text(text, m.chat.id, msg.message_id, parse_mode="HTML")
     
-    res_log = f"Upbit {fmt_num(u,0)} ₩ | ABCEX Buy {fmt_num(ab_buy,2)} ₽"
+    res_log = f"Upbit {fmt_num(u,0)} ₩ | ABCEX {fmt_num(ab_buy,2)} ₽"
     log_action(m.from_user, "Показать курс", result=res_log)
     
     USER_DATA[m.from_user.id]["requests"] += 1
@@ -227,7 +224,6 @@ def show_profile(m):
     bot.send_message(m.chat.id, txt, parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
     log_action(m.from_user, "Профиль")
 
-# --- ОТЗЫВ ---
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_feedback'], LANGS['en']['btn_feedback']])
 def feedback_start(m):
     init_user(m.from_user)
@@ -240,15 +236,13 @@ def feedback_save(m):
     l = USER_DATA[m.from_user.id]['lang']
     if m.text:
         name = m.from_user.first_name
-        nick = f"@{m.from_user.username}" if m.from_user.username else "Нет ника"
-        time_str = now_msk().strftime('%H:%M:%S')
-        
+        nick = f"@{m.from_user.username}" if m.from_user.username else "Нет"
         log_text = (
             f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
             f"👤 Имя: {name}\n"
             f"🔗 Ник / ID: {nick} | <code>{m.from_user.id}</code>\n"
             f"💬 Текст: <i>{m.text}</i>\n"
-            f"🕒 Время: {time_str} МСК"
+            f"🕒 Время: {now_msk().strftime('%H:%M:%S')} МСК"
         )
         bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
         bot.send_message(m.chat.id, LANGS[l]['feedback_thanks'], reply_markup=main_keyboard(m.from_user.id))
@@ -274,15 +268,15 @@ def admin_cb(c):
     
     if action == "stat":
         reqs = sum(u['requests'] for u in USER_DATA.values())
-        txt = f"📊 <b>Статистика</b>\n\nЮзеров в сессии: {len(ALL_USER_IDS)}\nАктивных подписок: {len(AUTO_USERS)}\nВсего запросов: {reqs}"
+        txt = f"📊 <b>Статистика</b>\n\nЮзеров: {len(ALL_USER_IDS)}\nАвтообновлений: {len(AUTO_USERS)}\nВсего запросов: {reqs}"
         bot.answer_callback_query(c.id)
         bot.send_message(c.message.chat.id, txt)
         
     elif action == "users":
-        txt = "👥 <b>Пользователи за сессию:</b>\n\n"
+        txt = "👥 <b>Пользователи:</b>\n\n"
         for uid, d in USER_DATA.items():
             nick = f"@{d['username']}" if d['username'] else d['first_name']
-            txt += f"• <code>{uid}</code> | {nick} | {d['joined'].strftime('%d.%m')}\n"
+            txt += f"• <code>{uid}</code> | {nick}\n"
         bot.answer_callback_query(c.id)
         bot.send_message(c.message.chat.id, txt[:4000])
         
@@ -315,12 +309,11 @@ def do_pm_send(m, tid):
     try:
         bot.send_message(tid, f"✉️ <b>СООБЩЕНИЕ ОТ АДМИНА:</b>\n\n{m.text}")
         bot.send_message(m.chat.id, "✅ Доставлено.")
-        log_action(m.from_user, f"Личное сообщение ID {tid}", result="Доставлено")
+        log_action(m.from_user, f"ЛС для {tid}", result="Успешно")
     except: 
         bot.send_message(m.chat.id, "❌ Ошибка отправки.")
-        log_action(m.from_user, f"Личное сообщение ID {tid}", result="Ошибка отправки")
 
-# ============== НАСТРОЙКА УВЕДОМЛЕНИЙ ==============
+# ============== УВЕДОМЛЕНИЯ ==============
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_auto'], LANGS['en']['btn_auto']])
 def toggle_auto(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
@@ -330,7 +323,6 @@ def toggle_auto(m):
            types.InlineKeyboardButton("24H", callback_data="auto_86400"))
     if m.chat.id in AUTO_USERS: kb.row(types.InlineKeyboardButton("🚫 OFF", callback_data="auto_0"))
     bot.send_message(m.chat.id, LANGS[l]['auto_menu'], reply_markup=kb)
-    log_action(m.from_user, "Открыл меню Автообновления")
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
 def auto_callback(c):
@@ -343,15 +335,7 @@ def auto_callback(c):
     else:
         AUTO_USERS[c.message.chat.id] = {"interval": val, "last": now_msk()}
         bot.edit_message_text(f"{LANGS[l]['auto_on_msg']} {val//3600}H.", c.message.chat.id, c.message.message_id)
-        log_action(c.from_user, "Автообновление", result=f"Включено на {val//3600} ч.")
-
-@bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_disable'], LANGS['en']['btn_disable']])
-def disable_notifications(m):
-    init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
-    if m.chat.id in AUTO_USERS:
-        AUTO_USERS.pop(m.chat.id, None)
-        bot.send_message(m.chat.id, LANGS[l]['auto_off_msg'])
-        log_action(m.from_user, "Отключил уведомления через меню")
+        log_action(c.from_user, "Автообновление", result=f"Включено ({val//3600}H)")
 
 @bot.message_handler(func=lambda m: True)
 def auto_update_kb(m):
@@ -360,15 +344,11 @@ def auto_update_kb(m):
 
 # ============== ФОН И ЗАПУСК ==============
 def keep_awake():
-    """АНТИСПЯЧКА ДЛЯ RENDER"""
     url = "https://telegram-rate-bot-ooc6.onrender.com"
     while True:
-        try:
-            requests.get(url, timeout=5)
-            logger.info("Пинг антиспячки отправлен")
-        except Exception as e:
-            logger.error(f"Ошибка антиспячки: {e}")
-        time.sleep(600)  # Каждые 10 минут
+        try: requests.get(url, timeout=5)
+        except: pass
+        time.sleep(600)
 
 def auto_worker():
     while True:
@@ -378,22 +358,37 @@ def auto_worker():
             if (now - cfg["last"]).total_seconds() >= cfg["interval"]:
                 try:
                     u, b, r, (ab_b, ab_s) = fetch_all_rates()
-                    l = USER_DATA.get(cid, {}).get("lang", "ru")
-                    bot.send_message(cid, f"🔔 <b>AUTO:</b> {fmt_num(u,0)} ₩ | {fmt_num(ab_b,2)} ₽", parse_mode="HTML")
-                    AUTO_USERS[cid]["last"] = now
-                except Exception as e:
-                    if "blocked" in str(e).lower():
-                        AUTO_USERS.pop(cid, None)
+                    if u and ab_b:
+                        bot.send_message(cid, f"🔔 <b>AUTO:</b> {fmt_num(u,0)} ₩ | {fmt_num(ab_b,2)} ₽", parse_mode="HTML")
+                        AUTO_USERS[cid]["last"] = now
+                except: pass
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Бот работает и не спит!", 200
+def home(): return "OK", 200
 
 if __name__ == "__main__":
+    # Исправление возможного конфликта вебхуков (гарантирует запуск)
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        logger.error(f"Ошибка удаления вебхука: {e}")
+
     threading.Thread(target=auto_worker, daemon=True).start()
-    threading.Thread(target=keep_awake, daemon=True).start() # Включена антиспячка
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000))), daemon=True).start()
+    threading.Thread(target=keep_awake, daemon=True).start()
     
+    # Надежный запуск Flask
+    port = int(os.environ.get("PORT", 10000))
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False), daemon=True).start()
+    
+    logger.info("Бот запущен...")
     while True:
-        try: bot.infinity_polling(skip_pending=True)
-        except Exception as e: time.sleep(5)
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, request_timeout=60)
+        except ApiTelegramException as e:
+            logger.error(f"Ошибка API: {e}")
+            time.sleep(10)
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {e}")
+            time.sleep(10)
