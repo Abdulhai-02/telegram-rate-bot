@@ -22,8 +22,8 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ВАШ ID (Обязательно проверьте его)
-MY_ADMIN_ID = 5266659205
+# ВАШ ID (Проверьте его корректность)
+MY_ADMIN_ID = 5143360493  
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
@@ -76,8 +76,6 @@ LANGS = {
         'sell': "Sell:",
         'updated': "⏱ Updated:",
         'contact': "💰 Exchange of any amounts — by agreement.\n📞 Contact: @Abdulkhaiii",
-        'feedback_prompt': "Write your feedback in one message:",
-        'feedback_thanks': "✅ Thank you! Feedback sent to admin.",
         'auto_menu': "Select update frequency:",
         'auto_off_msg': "🔕 Auto-updates disabled.",
         'auto_on_msg': "🔔 Alerts enabled:",
@@ -142,7 +140,7 @@ def main_keyboard(uid):
     if uid == MY_ADMIN_ID: m.row(LANGS[l]['btn_admin'])
     return m
 
-# ============== API (ИСпРАВЛЕНО: Добавлены заголовки) ==============
+# ============== API ==============
 def fetch_all_rates():
     headers = {"User-Agent": "Mozilla/5.0"}
     
@@ -377,10 +375,23 @@ def auto_worker():
         for cid, cfg in list(AUTO_USERS.items()):
             if (now - cfg["last"]).total_seconds() >= cfg["interval"]:
                 try:
+                    # ПОЛУЧАЕМ ВСЕ ДАННЫЕ ВКЛЮЧАЯ КУРС РУБЛЯ
                     u, b, r, (ab_b, ab_s) = fetch_all_rates()
-                    if u and ab_b:
-                        bot.send_message(cid, f"🔔 <b>AUTO:</b> {fmt_num(u,0)} ₩ | {fmt_num(ab_b,2)} ₽", parse_mode="HTML")
-                        AUTO_USERS[cid]["last"] = now
+                    l = USER_DATA.get(cid, {}).get("lang", "ru")
+                    
+                    if l == 'ru':
+                        text = (f"🔔 <b>АВТО-КУРС</b>\n\n"
+                                f"🇰🇷 Upbit: {fmt_num(u,0)} ₩\n"
+                                f"🇷🇺 ABCEX: {fmt_num(ab_b,2)} ₽\n"
+                                f"🔄 1М ₩ ≈ <b>{fmt_num(r,2)} ₽</b>")
+                    else:
+                        text = (f"🔔 <b>AUTO-RATE</b>\n\n"
+                                f"🇰🇷 Upbit: {fmt_num(u,0)} ₩\n"
+                                f"🇷🇺 ABCEX: {fmt_num(ab_b,2)} ₽\n"
+                                f"🔄 1M ₩ ≈ <b>{fmt_num(r,2)} ₽</b>")
+                    
+                    bot.send_message(cid, text, parse_mode="HTML")
+                    AUTO_USERS[cid]["last"] = now
                 except: pass
 
 app = Flask(__name__)
@@ -388,7 +399,6 @@ app = Flask(__name__)
 def home(): return "Бот работает и не спит!", 200
 
 if __name__ == "__main__":
-    # Исправление возможного конфликта вебхуков (гарантирует запуск)
     try:
         bot.remove_webhook()
         time.sleep(1)
@@ -398,7 +408,6 @@ if __name__ == "__main__":
     threading.Thread(target=auto_worker, daemon=True).start()
     threading.Thread(target=keep_awake, daemon=True).start()
     
-    # Надежный запуск Flask
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False), daemon=True).start()
     
