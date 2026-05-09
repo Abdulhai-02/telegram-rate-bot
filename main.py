@@ -25,7 +25,7 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-MY_ADMIN_ID = 5143360493  
+MY_ADMIN_ID = 5266659205  
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
