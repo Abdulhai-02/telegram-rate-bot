@@ -16,6 +16,7 @@ from flask import Flask
 
 # === ИМПОРТ MONGODB ===
 from pymongo import MongoClient
+import certifi # Исправление для стабильного коннекта на Render
 
 # ============== НАСТРОЙКИ ==============
 load_dotenv()
@@ -25,24 +26,32 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ВАШ ID (Обязательно проверьте его)
 MY_ADMIN_ID = 5266659205  
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
-# === ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# === ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ (ЖЕЛЕЗОБЕТОННОЕ) ===
 MONGO_URI = os.getenv("MONGO_URI")
 if MONGO_URI:
-    mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client.p2p_bot_db
-    users_collection = db.users
-    auto_collection = db.auto_updates
-    logger_db = logging.getLogger("MongoDB")
-    logger_db.info("✅ Подключено к MongoDB Atlas")
+    try:
+        # tlsCAFile нужен чтобы Render не блокировал защищенное соединение Atlas
+        mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+        mongo_client.server_info() # Принудительный пинг базы
+        db = mongo_client.p2p_bot_db
+        users_collection = db.users
+        auto_collection = db.auto_updates
+        logger.info("✅ УСПЕХ: Связь с MongoDB Atlas установлена!")
+    except Exception as e:
+        logger.error(f"❌ ОШИБКА ПОДКЛЮЧЕНИЯ К MONGODB: {e}")
+        users_collection = None
+        auto_collection = None
 else:
     users_collection = None
     auto_collection = None
-    print("⚠️ MONGO_URI не найден. Работаем в оперативной памяти (данные удалятся при рестарте).")
+    logger.warning("⚠️ MONGO_URI не найден.")
 
 # ============== ЛОКАЛИЗАЦИЯ ==============
 LANGS = {
@@ -110,9 +119,6 @@ USER_DATA = {}
 AUTO_USERS = {}
 ALL_USER_IDS = set() 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 # ============== СИНХРОНИЗАЦИЯ С БАЗОЙ ==============
 def load_db():
     if users_collection is None: return
@@ -133,8 +139,9 @@ def load_db():
                 "interval": doc["interval"],
                 "last": datetime.fromisoformat(doc["last"]) if doc.get("last") else None
             }
+        logger.info(f"✅ База загружена! Юзеров: {len(USER_DATA)}")
     except Exception as e:
-        logger.error(f"Ошибка загрузки БД: {e}")
+        logger.error(f"❌ Ошибка массовой загрузки БД: {e}")
 
 def save_user(uid):
     if users_collection is None or uid not in USER_DATA: return
@@ -172,7 +179,26 @@ def fmt_num(v, d=2):
 def init_user(user):
     uid = user.id
     ALL_USER_IDS.add(uid)
+    
+    # 🔴 ИСПРАВЛЕНО ЗДЕСЬ: Никаких слепых перезаписей!
     if uid not in USER_DATA:
+        if users_collection is not None:
+            try:
+                # Пытаемся сначала спасти профиль из облака
+                doc = users_collection.find_one({"_id": uid})
+                if doc:
+                    USER_DATA[uid] = {
+                        "lang": doc.get("lang", "ru"),
+                        "requests": doc.get("requests", 0),
+                        "last": datetime.fromisoformat(doc["last"]) if doc.get("last") else None,
+                        "joined": datetime.fromisoformat(doc["joined"]) if doc.get("joined") else now_msk(),
+                        "first_name": doc.get("first_name"),
+                        "username": doc.get("username")
+                    }
+                    return # Успешно скачали, выходим, чтобы не затереть!
+            except: pass
+            
+        # Создаем с нуля ТОЛЬКО если человека реально нет нигде
         USER_DATA[uid] = {
             "lang": "ru", "requests": 0, "last": None,
             "joined": now_msk(), "first_name": user.first_name, "username": user.username
@@ -197,7 +223,7 @@ def log_action(user, action, result=None):
         
         bot.send_message(ADMIN_LOG_CHAT_ID, log_text, parse_mode="HTML")
     except Exception as e:
-        logger.error(f"Ошибка отправки лога: {e}")
+        pass
 
 # ============== UI ==============
 def main_keyboard(uid):
@@ -246,7 +272,7 @@ def lang_set(c):
     l = c.data.split("_")[1]
     init_user(c.from_user)
     USER_DATA[c.from_user.id]['lang'] = l
-    save_user(c.from_user.id) # Сохраняем язык в БД
+    save_user(c.from_user.id)
     bot.delete_message(c.message.chat.id, c.message.message_id)
     bot.send_message(c.message.chat.id, LANGS[l]['welcome'], reply_markup=main_keyboard(c.from_user.id))
     log_action(c.from_user, f"Выбор языка ({'Русский' if l == 'ru' else 'English'})")
@@ -279,7 +305,7 @@ def show_rate(m):
     
     USER_DATA[m.from_user.id]["requests"] += 1
     USER_DATA[m.from_user.id]["last"] = now_msk()
-    save_user(m.from_user.id) # Сохраняем статусы в БД
+    save_user(m.from_user.id)
 
 @bot.message_handler(func=lambda m: m.text in [LANGS['ru']['btn_profile'], LANGS['en']['btn_profile']])
 def show_profile(m):
@@ -411,12 +437,12 @@ def auto_callback(c):
     val = int(c.data.split("_")[1])
     if val == 0:
         AUTO_USERS.pop(c.message.chat.id, None)
-        save_auto(c.message.chat.id) # Удаляем из БД
+        save_auto(c.message.chat.id)
         bot.edit_message_text(LANGS[l]['auto_off_msg'], c.message.chat.id, c.message.message_id)
         log_action(c.from_user, "Автообновление", result="Отключено")
     else:
         AUTO_USERS[c.message.chat.id] = {"interval": val, "last": now_msk()}
-        save_auto(c.message.chat.id) # Сохраняем в БД
+        save_auto(c.message.chat.id)
         bot.edit_message_text(f"{LANGS[l]['auto_on_msg']} {val//3600}H.", c.message.chat.id, c.message.message_id)
         log_action(c.from_user, "Автообновление", result=f"Включено ({val//3600}H)")
 
@@ -425,7 +451,7 @@ def disable_notifications(m):
     init_user(m.from_user); l = USER_DATA[m.from_user.id]['lang']
     if m.chat.id in AUTO_USERS:
         AUTO_USERS.pop(m.chat.id, None)
-        save_auto(m.chat.id) # Удаляем из БД
+        save_auto(m.chat.id)
         bot.send_message(m.chat.id, LANGS[l]['auto_off_msg'])
         log_action(m.from_user, "Отключил уведомления через меню")
 
@@ -465,11 +491,11 @@ def auto_worker():
                     
                     bot.send_message(cid, text, parse_mode="HTML")
                     AUTO_USERS[cid]["last"] = now
-                    save_auto(cid) # Обновляем время в БД
+                    save_auto(cid)
                 except Exception as e:
                     if "blocked" in str(e).lower():
                         AUTO_USERS.pop(cid, None)
-                        save_auto(cid) # Удаляем из БД, если юзер заблочил бота
+                        save_auto(cid)
 
 app = Flask(__name__)
 @app.route('/')
@@ -479,10 +505,9 @@ if __name__ == "__main__":
     try:
         bot.remove_webhook()
         time.sleep(1)
-    except Exception as e:
-        logger.error(f"Ошибка удаления вебхука: {e}")
+    except: pass
 
-    # Загружаем базу перед стартом бота
+    # Сначала пытаемся поднять базу
     load_db()
 
     threading.Thread(target=auto_worker, daemon=True).start()
@@ -491,13 +516,8 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False), daemon=True).start()
     
-    logger.info("Бот запущен...")
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=60)
-        except ApiTelegramException as e:
-            logger.error(f"Ошибка API: {e}")
-            time.sleep(10)
         except Exception as e:
-            logger.error(f"Критическая ошибка: {e}")
             time.sleep(10)
