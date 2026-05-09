@@ -11,7 +11,6 @@ import requests
 from dotenv import load_dotenv
 import telebot
 from telebot import types
-from telebot.apihelper import ApiTelegramException
 from flask import Flask
 
 # === ИМПОРТ MONGODB ===
@@ -26,7 +25,6 @@ if not TELEGRAM_TOKEN:
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML")
 
-# ВАШ ID И ID КАНАЛА ЛОГОВ
 MY_ADMIN_ID = 5266659205  
 ADMIN_LOG_CHAT_ID = -1003264764082
 MOSCOW_TZ = timezone(timedelta(hours=3))
@@ -38,9 +36,8 @@ logger = logging.getLogger(__name__)
 MONGO_URI = os.getenv("MONGO_URI")
 if MONGO_URI:
     try:
-        # tlsCAFile нужен чтобы Render не блокировал защищенное соединение Atlas
         mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
-        mongo_client.server_info() # Принудительный пинг базы
+        mongo_client.server_info() 
         db = mongo_client.p2p_bot_db
         users_collection = db.users
         auto_collection = db.auto_updates
@@ -179,17 +176,12 @@ def fmt_num(v, d=2):
     return f"{v:,.{d}f}".replace(",", " ")
 
 def init_user(user):
-    """
-    Умная инициализация: сначала ищем в RAM, потом в Базе,
-    и только если нигде нет - создаем профиль с нуля.
-    """
     uid = user.id
     ALL_USER_IDS.add(uid)
     
     if uid not in USER_DATA:
         if users_collection is not None:
             try:
-                # Пытаемся спасти профиль из облака
                 doc = users_collection.find_one({"_id": uid})
                 if doc:
                     USER_DATA[uid] = {
@@ -201,11 +193,10 @@ def init_user(user):
                         "username": doc.get("username")
                     }
                     logger.info(f"⬇️ Профиль пользователя {uid} успешно восстановлен из MongoDB (Запросов: {USER_DATA[uid]['requests']}).")
-                    return # Успешно скачали, выходим, чтобы не затереть!
+                    return 
             except Exception as e:
                 logger.error(f"Ошибка проверки пользователя {uid} в MongoDB: {e}")
             
-        # Создаем с нуля ТОЛЬКО если человека реально нет нигде
         USER_DATA[uid] = {
             "lang": "ru",
             "requests": 0,
@@ -218,9 +209,6 @@ def init_user(user):
         logger.info(f"🆕 Создан абсолютно новый профиль для пользователя {uid}")
 
 def log_action(user, action, result=None):
-    """
-    Отправка красивых и подробных логов в Telegram-канал администратора.
-    """
     try:
         name = user.first_name
         if user.last_name: 
@@ -303,7 +291,7 @@ def lang_set(c):
 def show_rate(m):
     init_user(m.from_user)
     l = USER_DATA[m.from_user.id]['lang']
-    msg = bot.send_message(m.chat.id, f"{LANGS[l]['loading']}...")
+    msg = bot.send_message(m.chat.id, f"{LANGS[l]['loading']}...", reply_markup=main_keyboard(m.from_user.id))
     
     u, b, r, (ab_buy, ab_sell) = fetch_all_rates()
     
@@ -355,12 +343,18 @@ def show_profile(m):
 def feedback_start(m):
     init_user(m.from_user)
     l = USER_DATA[m.from_user.id]['lang']
-    msg = bot.send_message(m.chat.id, LANGS[l]['feedback_prompt'], reply_markup=types.ForceReply())
+    # Больше никакого ForceReply! Только нормальное сообщение, кнопки останутся на месте.
+    msg = bot.send_message(m.chat.id, LANGS[l]['feedback_prompt'], reply_markup=main_keyboard(m.from_user.id))
     bot.register_next_step_handler(msg, feedback_save)
     log_action(m.from_user, "Нажал кнопку 'Отзыв'")
 
 def feedback_save(m):
     l = USER_DATA[m.from_user.id]['lang']
+    # Если юзер передумал и нажал другую кнопку меню - не сохраняем как отзыв
+    if m.text in [LANGS['ru']['btn_show'], LANGS['en']['btn_show'], LANGS['ru']['btn_profile']]:
+        bot.send_message(m.chat.id, "Отправка отзыва отменена.", reply_markup=main_keyboard(m.from_user.id))
+        return
+
     if m.text:
         name = m.from_user.first_name
         if m.from_user.last_name: 
@@ -402,7 +396,7 @@ def admin_cb(c):
         reqs = sum(u['requests'] for u in USER_DATA.values())
         txt = f"📊 <b>Статистика</b>\n\nЮзеров в базе: {len(ALL_USER_IDS)}\nАктивных подписок: {len(AUTO_USERS)}\nВсего запросов: {reqs}"
         bot.answer_callback_query(c.id)
-        bot.send_message(c.message.chat.id, txt)
+        bot.send_message(c.message.chat.id, txt, reply_markup=main_keyboard(c.from_user.id))
         
     elif action == "auto_menu":
         kb = types.InlineKeyboardMarkup()
@@ -436,7 +430,7 @@ def admin_cb(c):
         log_action(c.from_user, f"Массовая подписка ({hours}ч)", result=f"Успешно для {count} чел.")
 
     elif action == "auto_id":
-        msg = bot.send_message(c.message.chat.id, "Введите ID пользователя для тихой подписки:", reply_markup=types.ForceReply())
+        msg = bot.send_message(c.message.chat.id, "Введите ID пользователя для тихой подписки:")
         bot.register_next_step_handler(msg, adm_auto_step_id)
 
     elif action == "users":
@@ -445,19 +439,19 @@ def admin_cb(c):
             nick = f"@{d['username']}" if d['username'] else d['first_name']
             txt += f"• <code>{uid}</code> | {nick}\n"
         bot.answer_callback_query(c.id)
-        bot.send_message(c.message.chat.id, txt[:4000])
+        bot.send_message(c.message.chat.id, txt[:4000], reply_markup=main_keyboard(c.from_user.id))
 
     elif action == "bc":
-        msg = bot.send_message(c.message.chat.id, "Введите текст рассылки:", reply_markup=types.ForceReply())
+        msg = bot.send_message(c.message.chat.id, "Введите текст рассылки:")
         bot.register_next_step_handler(msg, do_bc)
 
 def adm_auto_step_id(m):
     try:
         target_id = int(m.text.strip())
-        msg = bot.send_message(m.chat.id, f"Введите интервал в часах (например, 1, 5 или 24) для {target_id}:", reply_markup=types.ForceReply())
+        msg = bot.send_message(m.chat.id, f"Введите интервал в часах (например, 1, 5 или 24) для {target_id}:")
         bot.register_next_step_handler(msg, lambda s: adm_auto_final(s, target_id))
     except ValueError: 
-        bot.send_message(m.chat.id, "❌ Ошибка. Вы ввели некорректный ID.")
+        bot.send_message(m.chat.id, "❌ Ошибка. Вы ввели некорректный ID.", reply_markup=main_keyboard(m.from_user.id))
 
 def adm_auto_final(m, tid):
     try:
@@ -467,10 +461,10 @@ def adm_auto_final(m, tid):
         AUTO_USERS[tid] = {"interval": interval_seconds, "last": now_msk()}
         save_auto(tid)
         
-        bot.send_message(m.chat.id, f"✅ <b>Успешно!</b> Для ID <code>{tid}</code> ТИХО включено автообновление каждые {hours}ч.", parse_mode="HTML")
+        bot.send_message(m.chat.id, f"✅ <b>Успешно!</b> Для ID <code>{tid}</code> ТИХО включено автообновление каждые {hours}ч.", parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
         log_action(m.from_user, f"Тихая подписка по ID ({tid})", result=f"Интервал {hours}ч")
     except ValueError: 
-        bot.send_message(m.chat.id, "❌ Ошибка. Интервал должен быть числом.")
+        bot.send_message(m.chat.id, "❌ Ошибка. Интервал должен быть числом.", reply_markup=main_keyboard(m.from_user.id))
 
 def do_bc(m):
     count = 0
@@ -480,7 +474,7 @@ def do_bc(m):
             count += 1
         except Exception:
             pass
-    bot.send_message(m.chat.id, f"✅ Рассылка успешно отправлена {count} чел.")
+    bot.send_message(m.chat.id, f"✅ Рассылка успешно отправлена {count} чел.", reply_markup=main_keyboard(m.from_user.id))
     log_action(m.from_user, "Рассылка всем", result=f"Доставлено: {count}")
 
 # ============== УВЕДОМЛЕНИЯ (ДЛЯ ПОЛЬЗОВАТЕЛЕЙ) ==============
@@ -526,7 +520,7 @@ def disable_notif(m):
     AUTO_USERS.pop(m.chat.id, None)
     save_auto(m.chat.id)
     
-    bot.send_message(m.chat.id, f"✅ <b>Успешно!</b> 🔕 {LANGS[l]['auto_off_msg']}", parse_mode="HTML")
+    bot.send_message(m.chat.id, f"✅ <b>Успешно!</b> 🔕 {LANGS[l]['auto_off_msg']}", parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
     log_action(m.from_user, "Отключил уведомления через меню")
 
 @bot.message_handler(func=lambda m: True)
