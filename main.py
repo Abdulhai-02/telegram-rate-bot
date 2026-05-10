@@ -540,6 +540,72 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     }
 
 
+def fetch_auto_rates() -> Dict[str, Optional[float]]:
+    """
+    Лёгкий запрос только для авто-рассылки:
+    только Upbit (одна биржа) + ABCEX + KRW/RUB.
+    Bithumb не запрашивается — экономия ресурсов.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        f_upbit   = pool.submit(_fetch_upbit)
+        f_krw_rub = pool.submit(_fetch_krw_rub)
+        f_abcex   = pool.submit(_fetch_abcex)
+
+        def _safe(future, default=None):
+            try:
+                return future.result(timeout=_API_MAX_WAIT)
+            except Exception:
+                return default
+
+        upbit   = _safe(f_upbit)
+        krw_rub = _safe(f_krw_rub)
+        abcex   = _safe(f_abcex, default=(None, None))
+
+    ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
+    return {
+        "upbit":   upbit,
+        "krw_rub": krw_rub,
+        "ab_buy":  ab_buy,
+        "ab_sell": ab_sell,
+    }
+
+
+def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
+    """
+    Компактное авто-сообщение.
+    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+      • ₩  — цена 1 USDT в KRW (Upbit)
+      • ₽  — цена 1 USDT в RUB (среднее ABCEX bid/ask)
+      • ₽  — стоимость 1 000 000 KRW в RUB (без запятой, целое)
+    """
+    usdt_krw = rates.get("upbit")
+
+    ab_buy  = rates.get("ab_buy")
+    ab_sell = rates.get("ab_sell")
+    if ab_buy is not None and ab_sell is not None:
+        usdt_rub: Optional[float] = (ab_buy + ab_sell) / 2
+    elif ab_buy is not None:
+        usdt_rub = ab_buy
+    elif ab_sell is not None:
+        usdt_rub = ab_sell
+    else:
+        usdt_rub = None
+
+    krw_rub = rates.get("krw_rub")  # рублей за 1 000 000 ₩
+
+    # ₩ — целое без десятичных
+    part_krw = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
+    # ₽ USDT — два знака
+    part_rub = f"{fmt_num(usdt_rub, 2)} ₽" if usdt_rub is not None else "— ₽"
+    # ₽ за млн ₩ — целое, с запятой как разделитель тысяч (50,459)
+    if krw_rub is not None:
+        part_krw_rub = f"{int(round(krw_rub)):,} ₽"
+    else:
+        part_krw_rub = "— ₽"
+
+    return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
+
+
 def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     """Формирует полное HTML-сообщение с курсами."""
     T  = LANGS[lang]
@@ -618,41 +684,40 @@ def msg_show_rate(m: types.Message) -> None:
     lang = get_lang(uid)
     T    = LANGS[lang]
 
-    # Сразу возвращаем основную клавиатуру + placeholder "загрузка"
-    placeholder = bot.send_message(
-        m.chat.id,
-        T["loading"],
-        reply_markup=main_keyboard(uid),
-    )
+    # 1. Сразу восстанавливаем основную клавиатуру отдельным сообщением
+    bot.send_message(m.chat.id, "⏳", reply_markup=main_keyboard(uid))
 
+    # 2. Анимация загрузки: . → .. → ... (три отдельных сообщения с задержкой)
+    anim = bot.send_message(m.chat.id, ".")
+    time.sleep(0.4)
+    try:
+        bot.edit_message_text("..", m.chat.id, anim.message_id)
+    except Exception:
+        pass
+    time.sleep(0.4)
+    try:
+        bot.edit_message_text("...", m.chat.id, anim.message_id)
+    except Exception:
+        pass
+
+    # 3. Запрашиваем курсы пока крутится анимация
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
+    # 4. Удаляем анимацию (и "⏳"-сообщение не нужно удалять — оно с клавиатурой)
+    try:
+        bot.delete_message(m.chat.id, anim.message_id)
+    except Exception:
+        pass
+
     if not has_data:
-        # Редактируем placeholder — показываем ошибку
-        try:
-            bot.edit_message_text(
-                T["error_fetch"],
-                m.chat.id,
-                placeholder.message_id,
-                parse_mode="HTML",
-            )
-        except Exception:
-            bot.send_message(m.chat.id, T["error_fetch"], parse_mode="HTML")
+        bot.send_message(m.chat.id, T["error_fetch"], parse_mode="HTML")
         log_action(m.from_user, "Курс", result="⚠️ все API недоступны")
         return
 
+    # 5. Отправляем курс новым сообщением (после удалённой анимации)
     text = build_rate_message(rates, lang)
-    try:
-        bot.edit_message_text(
-            text,
-            m.chat.id,
-            placeholder.message_id,
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        logger.warning("edit_message_text failed (%s) — sending new message", exc)
-        bot.send_message(m.chat.id, text, parse_mode="HTML")
+    bot.send_message(m.chat.id, text, parse_mode="HTML")
 
     # Статистика
     with _DATA_LOCK:
@@ -1156,24 +1221,17 @@ def _auto_worker() -> None:
             if not due:
                 continue
 
-            # Один запрос к API для всего цикла
-            rates    = fetch_all_rates()
+            # Один компактный запрос к API (только Upbit + ABCEX + KRW/RUB)
+            rates    = fetch_auto_rates()
             has_data = any(v is not None for v in rates.values())
             if not has_data:
                 logger.warning("auto_worker: все API недоступны, пропускаем цикл")
                 continue
 
+            text = build_auto_message(rates)   # один текст для всех
+
             for cid, cfg in due.items():
                 try:
-                    lang = get_lang(cid)
-                    label = "АВТО-КУРС" if lang == "ru" else "AUTO-RATE"
-                    text  = (
-                        f"🔔 <b>{label}</b>\n\n"
-                        f"🇰🇷 Upbit:  <b>{fmt_num(rates['upbit'],   0)} ₩</b>\n"
-                        f"🇷🇺 ABCEX:  <b>{fmt_num(rates['ab_buy'], 2)} ₽</b>\n"
-                        f"🔄 1M ₩ ≈ <b>{fmt_num(rates['krw_rub'], 2)} ₽</b>\n"
-                        f"⏱ {now.strftime('%H:%M:%S')} МСК"
-                    )
                     bot.send_message(cid, text, parse_mode="HTML")
 
                     with _DATA_LOCK:
