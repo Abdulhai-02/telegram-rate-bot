@@ -42,7 +42,7 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
-# ---------- Render Anti-Sleep (self-ping каждые 14 мин) ----------
+# ---------- Render Anti-Sleep (self-ping) ----------
 RENDER_URL = os.getenv("RENDER_URL", "")   # например: https://your-app.onrender.com
 
 # ---------- Таймауты API ----------
@@ -1006,7 +1006,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
             auto_info = (
                 f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
                 f"  ⏱ Интервал:            <b>каждые {hours}H</b>\n"
-                f"  📅 Включено:           {fmt_dt(a.get('enabled_at'))}\n"
+                f"  📅 Включено:            {fmt_dt(a.get('enabled_at'))}\n"
                 f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
             )
         else:
@@ -1040,7 +1040,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
     elif action == "auto_menu":
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(
-            types.InlineKeyboardButton("✅ Включить всем",     callback_data="adm_auto_all"),
+            types.InlineKeyboardButton("✅ Включить всем",      callback_data="adm_auto_all"),
             types.InlineKeyboardButton("👤 Подключить по ID",  callback_data="adm_auto_id"),
         )
         bot.edit_message_text(
@@ -1263,24 +1263,29 @@ def _auto_worker() -> None:
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
     """
-    Пингует собственный Flask-сервер каждые 14 минут,
+    Пингует собственный Flask-сервер каждые 10 минут,
     чтобы Render не засыпал бесплатный инстанс.
-    Активируется только если задана переменная RENDER_URL.
     """
     if not RENDER_URL:
-        logger.info("anti_sleep: RENDER_URL не задан — воркер не запущен")
+        logger.warning("⚠️ ВНИМАНИЕ: Переменная RENDER_URL не задана в настройках Render! Анти-сон отключен, бот может уснуть.")
         return
 
     ping_url = RENDER_URL.rstrip("/") + "/ping"
-    logger.info("🏓 anti_sleep: пингую %s каждые 14 мин", ping_url)
+    logger.info("🏓 anti_sleep: запущен. Буду пинговать %s каждые 10 мин", ping_url)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
 
     while True:
-        time.sleep(14 * 60)   # 14 минут (Render засыпает после 15)
+        # Спим 10 минут (600 секунд) вместо 14, чтобы был запас времени (Render усыпляет ровно через 15)
+        time.sleep(600)
         try:
-            r = requests.get(ping_url, timeout=10)
-            logger.info("anti_sleep ping: %d", r.status_code)
+            # Отправляем запрос снаружи через внешний URL
+            r = requests.get(ping_url, headers=headers, timeout=10)
+            logger.info("✅ anti_sleep ping успешно: %d", r.status_code)
         except Exception as exc:
-            logger.warning("anti_sleep ping failed: %s", exc)
+            logger.warning("❌ anti_sleep ping ошибка: %s", exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════
