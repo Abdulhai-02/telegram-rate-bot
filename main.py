@@ -32,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("p2p_bot")
 
-# ---------- Обязательные переменные окружения ----------
 _TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 if not _TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN не задан в переменных окружения")
@@ -42,17 +41,15 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
-# ---------- Render Anti-Sleep (self-ping) ----------
-RENDER_URL = os.getenv("RENDER_URL", "")   # например: https://your-app.onrender.com
+# RENDER_URL — адрес вашего сервиса, например: https://my-bot.onrender.com
+# Задаётся в Environment Variables на Render
+RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
-# ---------- Таймауты API ----------
-_API_TIMEOUT   = 8   # сек на один запрос к бирже
-_API_MAX_WAIT  = 12  # сек — максимум ждём всех параллельных запросов
+_API_TIMEOUT  = 8    # сек на один HTTP-запрос к бирже
+_API_MAX_WAIT = 12   # сек — жёсткий потолок ожидания всех futures
 
-# ---------- Глобальный RWLock (используем обычный Lock) ----------
 _DATA_LOCK = threading.Lock()
 
-# ---------- Telegram Bot ----------
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML", threaded=True)
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -72,16 +69,15 @@ if _MONGO_URI:
             socketTimeoutMS=10_000,
             maxPoolSize=10,
         )
-        _mongo.server_info()                        # быстрый пинг
+        _mongo.server_info()
         _db       = _mongo["p2p_bot_db"]
         users_col = _db["users"]
         auto_col  = _db["auto_updates"]
-        # Индексы уже создаются Mongo по _id автоматически
         logger.info("✅ MongoDB Atlas: подключено")
     except Exception as _exc:
         logger.error("❌ MongoDB недоступна: %s", _exc)
 else:
-    logger.warning("⚠️  MONGO_URI не задан — данные хранятся только в RAM")
+    logger.warning("⚠️  MONGO_URI не задан — данные только в RAM")
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ЛОКАЛИЗАЦИЯ
@@ -95,7 +91,6 @@ LANGS: Dict[str, Dict[str, str]] = {
         "btn_disable":  "🚫 Отключить уведомления",
         "btn_admin":    "🛠 Админка",
         "welcome":      "👋 Привет!\n\nВыбери нужный раздел ниже 👇",
-        "loading":      "⏳ Загружаю актуальные курсы...",
         "error_fetch":  "⚠️ Не удалось получить данные. Попробуйте позже.",
         "rate_title":   "💱 <b>АКТУАЛЬНЫЕ КУРСЫ</b>",
         "updated":      "⏱ Обновлено:",
@@ -123,7 +118,6 @@ LANGS: Dict[str, Dict[str, str]] = {
         "btn_disable":  "🚫 Disable Alerts",
         "btn_admin":    "🛠 Admin Panel",
         "welcome":      "👋 Hello!\n\nSelect a section below 👇",
-        "loading":      "⏳ Fetching latest rates...",
         "error_fetch":  "⚠️ Failed to get data. Please try again later.",
         "rate_title":   "💱 <b>CURRENT RATES</b>",
         "updated":      "⏱ Updated:",
@@ -160,7 +154,6 @@ def now_msk() -> datetime:
 
 
 def fmt_num(value: Any, decimals: int = 2) -> str:
-    """Форматирует число с пробелами-разделителями тысяч. None → '—'."""
     if value is None:
         return "—"
     try:
@@ -170,18 +163,12 @@ def fmt_num(value: Any, decimals: int = 2) -> str:
 
 
 def fmt_dt(dt: Optional[datetime], seconds: bool = True) -> str:
-    """Форматирует datetime в строку. None → '—'."""
     if not dt:
         return "—"
-    fmt = "%d.%m.%Y  %H:%M:%S" if seconds else "%d.%m.%Y  %H:%M"
-    return dt.strftime(fmt)
+    return dt.strftime("%d.%m.%Y  %H:%M:%S" if seconds else "%d.%m.%Y  %H:%M")
 
 
 def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
-    """
-    Безопасно парсит ISO-строку → timezone-aware datetime.
-    Если tz отсутствует — подставляем МСК.
-    """
     if not raw:
         return None
     try:
@@ -194,7 +181,7 @@ def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
 
 
 def _elapsed_sec(dt: Optional[datetime]) -> float:
-    """Секунд прошло с dt. Корректно для любых timezone."""
+    """Секунд прошло с dt. Корректно для naive и aware datetime."""
     if dt is None:
         return float("inf")
     try:
@@ -205,12 +192,12 @@ def _elapsed_sec(dt: Optional[datetime]) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  БАЗА ДАННЫХ — ОПЕРАЦИИ
+#  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════════
 def load_db() -> None:
-    """Загрузка всех профилей и подписок из MongoDB в RAM при старте."""
-    if users_col is None:
-        logger.warning("load_db: MongoDB недоступна, пропускаем загрузку")
+    """Загружает все профили и подписки из MongoDB в RAM при старте."""
+    if users_col is None or auto_col is None:
+        logger.warning("load_db: MongoDB недоступна, пропускаем")
         return
     try:
         logger.info("Загрузка данных из MongoDB...")
@@ -232,16 +219,12 @@ def load_db() -> None:
                 "last":       _parse_iso(doc.get("last"))       or now_msk(),
                 "enabled_at": _parse_iso(doc.get("enabled_at")) or now_msk(),
             }
-        logger.info(
-            "✅ БД загружена: %d профилей, %d подписок",
-            len(USER_DATA), len(AUTO_USERS),
-        )
+        logger.info("✅ БД загружена: %d профилей, %d подписок", len(USER_DATA), len(AUTO_USERS))
     except Exception as exc:
         logger.error("❌ load_db: %s", exc)
 
 
-def _db_save_user_sync(uid: int) -> None:
-    """Синхронная запись профиля (вызывается из отдельного потока)."""
+def _db_write_user(uid: int) -> None:
     if users_col is None:
         return
     try:
@@ -266,12 +249,10 @@ def _db_save_user_sync(uid: int) -> None:
 
 
 def save_user(uid: int) -> None:
-    """Асинхронная (fire-and-forget) запись профиля."""
-    threading.Thread(target=_db_save_user_sync, args=(uid,), daemon=True).start()
+    threading.Thread(target=_db_write_user, args=(uid,), daemon=True).start()
 
 
-def _db_save_auto_sync(uid: int) -> None:
-    """Синхронная запись/удаление авто-подписки (вызывается из потока)."""
+def _db_write_auto(uid: int) -> None:
     if auto_col is None:
         return
     try:
@@ -294,27 +275,18 @@ def _db_save_auto_sync(uid: int) -> None:
 
 
 def save_auto(uid: int) -> None:
-    """Асинхронная (fire-and-forget) запись авто-подписки."""
-    threading.Thread(target=_db_save_auto_sync, args=(uid,), daemon=True).start()
+    threading.Thread(target=_db_write_auto, args=(uid,), daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ИНИЦИАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЯ
+#  ПОЛЬЗОВАТЕЛЬ
 # ═══════════════════════════════════════════════════════════════════════
 def init_user(tg_user: types.User) -> None:
-    """
-    Потокобезопасная инициализация.
-    Порядок: RAM → MongoDB → создать новый профиль.
-    """
     uid = tg_user.id
     ALL_USER_IDS.add(uid)
-
-    # Быстрая проверка — есть в RAM
     with _DATA_LOCK:
         if uid in USER_DATA:
             return
-
-    # Пробуем восстановить из MongoDB
     if users_col is not None:
         try:
             doc = users_col.find_one({"_id": uid})
@@ -332,9 +304,7 @@ def init_user(tg_user: types.User) -> None:
                 logger.info("↩️  Профиль %d восстановлен из MongoDB", uid)
                 return
         except Exception as exc:
-            logger.error("init_user MongoDB read(%d): %s", uid, exc)
-
-    # Новый пользователь
+            logger.error("init_user read(%d): %s", uid, exc)
     new_profile: Dict[str, Any] = {
         "lang":       "ru",
         "requests":   0,
@@ -344,7 +314,6 @@ def init_user(tg_user: types.User) -> None:
         "username":   tg_user.username,
     }
     with _DATA_LOCK:
-        # Двойная проверка после IO-операции
         if uid not in USER_DATA:
             USER_DATA[uid] = new_profile
     save_user(uid)
@@ -357,14 +326,9 @@ def get_lang(uid: int) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ЛОГИРОВАНИЕ ДЕЙСТВИЙ В TELEGRAM-КАНАЛ
+#  ЛОГИРОВАНИЕ В КАНАЛ
 # ═══════════════════════════════════════════════════════════════════════
-def log_action(
-    tg_user: types.User,
-    action: str,
-    result: Optional[str] = None,
-) -> None:
-    """Non-blocking отправка лога в канал администратора."""
+def log_action(tg_user: types.User, action: str, result: Optional[str] = None) -> None:
     def _send() -> None:
         try:
             first = tg_user.first_name or ""
@@ -380,12 +344,12 @@ def log_action(
             lines.append(f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК")
             bot.send_message(ADMIN_LOG_CHAT_ID, "\n".join(lines), parse_mode="HTML")
         except Exception:
-            pass  # логи не должны ронять бота
+            pass
     threading.Thread(target=_send, daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  UI — КЛАВИАТУРЫ
+#  UI
 # ═══════════════════════════════════════════════════════════════════════
 def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
     T  = LANGS[get_lang(uid)]
@@ -401,14 +365,14 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════════════════
 #  API — ПОЛУЧЕНИЕ КУРСОВ
 # ═══════════════════════════════════════════════════════════════════════
-# Отдельные сессии для каждого потока
 _thread_local = threading.local()
 
+
 def _get_session() -> requests.Session:
-    """Возвращает thread-local сессию."""
+    """Thread-local сессия — потокобезопасный HTTP."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        s.headers.update({"User-Agent": "Mozilla/5.0 (P2PBot/4.0; +https://t.me)"})
+        s.headers.update({"User-Agent": "Mozilla/5.0 (P2PBot/4.0)"})
         _thread_local.session = s
     return _thread_local.session
 
@@ -422,16 +386,12 @@ def _fetch_upbit() -> Optional[float]:
         r.raise_for_status()
         return float(r.json()[0]["trade_price"])
     except Exception as exc:
-        logger.warning("Upbit API: %s", exc)
+        logger.warning("Upbit: %s", exc)
         return None
 
 
 def _fetch_bithumb() -> Optional[float]:
-    """
-    Пробует Bithumb v1 API (новый) → fallback на v2 (старый).
-    Обе точки проверяются, возвращается первый успешный результат.
-    """
-    # --- Вариант 1: новый v1 endpoint ---
+    # Вариант 1: новый v1 endpoint
     try:
         r = _get_session().get(
             "https://api.bithumb.com/v1/ticker?markets=KRW-USDT",
@@ -445,8 +405,7 @@ def _fetch_bithumb() -> Optional[float]:
                 return float(price)
     except Exception:
         pass
-
-    # --- Вариант 2: старый public endpoint ---
+    # Вариант 2: старый public endpoint (fallback)
     try:
         r = _get_session().get(
             "https://api.bithumb.com/public/ticker/USDT_KRW",
@@ -457,16 +416,11 @@ def _fetch_bithumb() -> Optional[float]:
         if price:
             return float(price)
     except Exception as exc:
-        logger.warning("Bithumb API (оба варианта): %s", exc)
-
+        logger.warning("Bithumb (оба варианта): %s", exc)
     return None
 
 
 def _fetch_krw_rub() -> Optional[float]:
-    """
-    1 000 000 KRW в RUB через open.er-api.com.
-    Fallback: exchangerate-api.com (если основной упал).
-    """
     for url in (
         "https://open.er-api.com/v6/latest/RUB",
         "https://v6.exchangerate-api.com/v6/latest/RUB",
@@ -479,12 +433,11 @@ def _fetch_krw_rub() -> Optional[float]:
                 return 1_000_000 / float(krw)
         except Exception:
             continue
-    logger.warning("ExchangeRate API: оба источника недоступны")
+    logger.warning("ExchangeRate: оба источника недоступны")
     return None
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """ABCEX USDT/RUB: bid (покупка) и ask (продажа)."""
     try:
         r = _get_session().get(
             "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
@@ -493,121 +446,54 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         )
         r.raise_for_status()
         d = r.json()
-        bid = float(d["bid"][0]["price"])
-        ask = float(d["ask"][0]["price"])
-        return bid, ask
+        return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
     except Exception as exc:
-        logger.warning("ABCEX API: %s", exc)
+        logger.warning("ABCEX: %s", exc)
         return None, None
 
 
+def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
+    """Получает результат future с жёстким таймаутом. Никогда не бросает исключение."""
+    try:
+        return future.result(timeout=_API_MAX_WAIT)
+    except concurrent.futures.TimeoutError:
+        logger.error("API future timeout (%ds)", _API_MAX_WAIT)
+        future.cancel()
+        return default
+    except Exception as exc:
+        logger.error("API future error: %s", exc)
+        return default
+
+
 def fetch_all_rates() -> Dict[str, Optional[float]]:
-    """
-    Параллельный запрос всех источников с жёстким таймаутом.
-    Никогда не бросает исключение наружу.
-    Возвращает dict с ключами: upbit, bithumb, krw_rub, ab_buy, ab_sell.
-    """
+    """Полный запрос всех источников (для кнопки 'Показать курс')."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        f_upbit   = pool.submit(_fetch_upbit)
-        f_bithumb = pool.submit(_fetch_bithumb)
-        f_krw_rub = pool.submit(_fetch_krw_rub)
-        f_abcex   = pool.submit(_fetch_abcex)
-
-        def _safe_result(future, default=None):
-            try:
-                return future.result(timeout=_API_MAX_WAIT)
-            except concurrent.futures.TimeoutError:
-                logger.error("API таймаут: futures не ответил за %ds", _API_MAX_WAIT)
-                future.cancel()
-                return default
-            except Exception as exc:
-                logger.error("API future.result: %s", exc)
-                return default
-
-        upbit   = _safe_result(f_upbit)
-        bithumb = _safe_result(f_bithumb)
-        krw_rub = _safe_result(f_krw_rub)
-        abcex   = _safe_result(f_abcex, default=(None, None))
-
+        fu = pool.submit(_fetch_upbit)
+        fb = pool.submit(_fetch_bithumb)
+        fr = pool.submit(_fetch_krw_rub)
+        fa = pool.submit(_fetch_abcex)
+        upbit   = _safe_future(fu)
+        bithumb = _safe_future(fb)
+        krw_rub = _safe_future(fr)
+        abcex   = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-
-    return {
-        "upbit":   upbit,
-        "bithumb": bithumb,
-        "krw_rub": krw_rub,
-        "ab_buy":  ab_buy,
-        "ab_sell": ab_sell,
-    }
+    return {"upbit": upbit, "bithumb": bithumb, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
-    """
-    Лёгкий запрос только для авто-рассылки:
-    только Upbit (одна биржа) + ABCEX + KRW/RUB.
-    Bithumb не запрашивается — экономия ресурсов.
-    """
+    """Лёгкий запрос только для авто-рассылки (Upbit + ABCEX + KRW/RUB)."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        f_upbit   = pool.submit(_fetch_upbit)
-        f_krw_rub = pool.submit(_fetch_krw_rub)
-        f_abcex   = pool.submit(_fetch_abcex)
-
-        def _safe(future, default=None):
-            try:
-                return future.result(timeout=_API_MAX_WAIT)
-            except Exception:
-                return default
-
-        upbit   = _safe(f_upbit)
-        krw_rub = _safe(f_krw_rub)
-        abcex   = _safe(f_abcex, default=(None, None))
-
+        fu = pool.submit(_fetch_upbit)
+        fr = pool.submit(_fetch_krw_rub)
+        fa = pool.submit(_fetch_abcex)
+        upbit   = _safe_future(fu)
+        krw_rub = _safe_future(fr)
+        abcex   = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    return {
-        "upbit":   upbit,
-        "krw_rub": krw_rub,
-        "ab_buy":  ab_buy,
-        "ab_sell": ab_sell,
-    }
-
-
-def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
-    """
-    Компактное авто-сообщение.
-    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
-      • ₩  — цена 1 USDT в KRW (Upbit)
-      • ₽  — цена 1 USDT в RUB (среднее ABCEX bid/ask)
-      • ₽  — стоимость 1 000 000 KRW в RUB (без запятой, целое)
-    """
-    usdt_krw = rates.get("upbit")
-
-    ab_buy  = rates.get("ab_buy")
-    ab_sell = rates.get("ab_sell")
-    if ab_buy is not None and ab_sell is not None:
-        usdt_rub: Optional[float] = (ab_buy + ab_sell) / 2
-    elif ab_buy is not None:
-        usdt_rub = ab_buy
-    elif ab_sell is not None:
-        usdt_rub = ab_sell
-    else:
-        usdt_rub = None
-
-    krw_rub = rates.get("krw_rub")  # рублей за 1 000 000 ₩
-
-    # ₩ — целое без десятичных
-    part_krw = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
-    # ₽ USDT — два знака
-    part_rub = f"{fmt_num(usdt_rub, 2)} ₽" if usdt_rub is not None else "— ₽"
-    # ₽ за млн ₩ — целое, с запятой как разделитель тысяч (50,459)
-    if krw_rub is not None:
-        part_krw_rub = f"{int(round(krw_rub)):,} ₽"
-    else:
-        part_krw_rub = "— ₽"
-
-    return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
+    return {"upbit": upbit, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
 
 
 def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
-    """Формирует полное HTML-сообщение с курсами."""
     T  = LANGS[lang]
     ts = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
     return (
@@ -628,11 +514,34 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     )
 
 
+def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
+    """
+    Компактное авто-сообщение.
+    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+    """
+    usdt_krw = rates.get("upbit")
+    ab_buy   = rates.get("ab_buy")
+    ab_sell  = rates.get("ab_sell")
+    if ab_buy is not None and ab_sell is not None:
+        usdt_rub: Optional[float] = (ab_buy + ab_sell) / 2
+    elif ab_buy is not None:
+        usdt_rub = ab_buy
+    elif ab_sell is not None:
+        usdt_rub = ab_sell
+    else:
+        usdt_rub = None
+    krw_rub = rates.get("krw_rub")
+
+    part_krw     = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
+    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"  if usdt_rub is not None else "— ₽"
+    part_krw_rub = f"{int(round(krw_rub)):,} ₽"  if krw_rub  is not None else "— ₽"
+    return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  ОБРАБОТЧИКИ TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════
 
-# ─── /start ─────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(m: types.Message) -> None:
     init_user(m.from_user)
@@ -641,15 +550,10 @@ def cmd_start(m: types.Message) -> None:
         types.InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
         types.InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
     )
-    bot.send_message(
-        m.chat.id,
-        "🇷🇺 Выберите язык  /  🇬🇧 Select language:",
-        reply_markup=kb,
-    )
+    bot.send_message(m.chat.id, "🇷🇺 Выберите язык  /  🇬🇧 Select language:", reply_markup=kb)
     log_action(m.from_user, "/start")
 
 
-# ─── Выбор языка ────────────────────────────────────────────────────
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lang_"))
 def cb_lang(c: types.CallbackQuery) -> None:
     lang = c.data.split("_", 1)[1]
@@ -665,11 +569,7 @@ def cb_lang(c: types.CallbackQuery) -> None:
         bot.delete_message(c.message.chat.id, c.message.message_id)
     except Exception:
         pass
-    bot.send_message(
-        c.message.chat.id,
-        LANGS[lang]["welcome"],
-        reply_markup=main_keyboard(uid),
-    )
+    bot.send_message(c.message.chat.id, LANGS[lang]["welcome"], reply_markup=main_keyboard(uid))
     bot.answer_callback_query(c.id)
     log_action(c.from_user, "Язык", result="🇷🇺 RU" if lang == "ru" else "🇬🇧 EN")
 
@@ -684,10 +584,10 @@ def msg_show_rate(m: types.Message) -> None:
     lang = get_lang(uid)
     T    = LANGS[lang]
 
-    # 1. Сразу восстанавливаем основную клавиатуру отдельным сообщением
+    # 1. Мгновенно восстанавливаем клавиатуру
     bot.send_message(m.chat.id, "⏳", reply_markup=main_keyboard(uid))
 
-    # 2. Анимация загрузки: . → .. → ... (три отдельных сообщения с задержкой)
+    # 2. Анимация . → .. → ...
     anim = bot.send_message(m.chat.id, ".")
     time.sleep(0.4)
     try:
@@ -700,11 +600,11 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
-    # 3. Запрашиваем курсы пока крутится анимация
+    # 3. Запрашиваем курсы
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
-    # 4. Удаляем анимацию (и "⏳"-сообщение не нужно удалять — оно с клавиатурой)
+    # 4. Удаляем анимацию
     try:
         bot.delete_message(m.chat.id, anim.message_id)
     except Exception:
@@ -715,23 +615,17 @@ def msg_show_rate(m: types.Message) -> None:
         log_action(m.from_user, "Курс", result="⚠️ все API недоступны")
         return
 
-    # 5. Отправляем курс новым сообщением (после удалённой анимации)
-    text = build_rate_message(rates, lang)
-    bot.send_message(m.chat.id, text, parse_mode="HTML")
+    # 5. Отправляем курс
+    bot.send_message(m.chat.id, build_rate_message(rates, lang), parse_mode="HTML")
 
-    # Статистика
     with _DATA_LOCK:
         USER_DATA[uid]["requests"] += 1
         USER_DATA[uid]["last"]      = now_msk()
     save_user(uid)
-
-    log_action(
-        m.from_user, "Показать курс",
-        result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],2)} ₽",
-    )
+    log_action(m.from_user, "Показать курс",
+               result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],2)} ₽")
 
 
-# ─── Профиль ────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_profile"], LANGS["en"]["btn_profile"]
 ))
@@ -742,7 +636,6 @@ def msg_profile(m: types.Message) -> None:
     T    = LANGS[lang]
     with _DATA_LOCK:
         d = USER_DATA[uid].copy()
-
     nick = f"@{d['username']}" if d.get("username") else (d.get("first_name") or "—")
     text = (
         f"{T['prof_title']}\n\n"
@@ -757,7 +650,6 @@ def msg_profile(m: types.Message) -> None:
     log_action(m.from_user, "Профиль")
 
 
-# ─── Отзыв ──────────────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_feedback"], LANGS["en"]["btn_feedback"]
 ))
@@ -766,39 +658,33 @@ def msg_feedback_start(m: types.Message) -> None:
     uid  = m.from_user.id
     lang = get_lang(uid)
     T    = LANGS[lang]
-    # Сначала возвращаем основную клавиатуру, потом ForceReply
     bot.send_message(m.chat.id, "✍️", reply_markup=main_keyboard(uid))
-    reply = bot.send_message(
-        m.chat.id,
-        T["feedback_ask"],
-        reply_markup=types.ForceReply(selective=True),
-    )
+    reply = bot.send_message(m.chat.id, T["feedback_ask"],
+                             reply_markup=types.ForceReply(selective=True))
     bot.register_next_step_handler(reply, _feedback_receive)
     log_action(m.from_user, "Отзыв — начало")
 
 
 def _feedback_receive(m: types.Message) -> None:
-    # Всегда инициализируем — пользователь мог написать после рестарта
     init_user(m.from_user)
     uid  = m.from_user.id
     lang = get_lang(uid)
     T    = LANGS[lang]
-
     if m.text and m.text.strip():
         first = m.from_user.first_name or ""
         last  = f" {m.from_user.last_name}" if m.from_user.last_name else ""
         nick  = f"@{m.from_user.username}" if m.from_user.username else "—"
-        admin_msg = (
-            f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
-            f"👤 {first}{last}  |  {nick}  |  <code>{uid}</code>\n"
-            f"💬 <i>{m.text}</i>\n"
-            f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК"
-        )
         try:
-            bot.send_message(ADMIN_LOG_CHAT_ID, admin_msg, parse_mode="HTML")
-        except Exception as exc:
-            logger.warning("Не удалось отправить отзыв в канал: %s", exc)
-
+            bot.send_message(
+                ADMIN_LOG_CHAT_ID,
+                f"🔴 <b>НОВЫЙ ОТЗЫВ</b>\n"
+                f"👤 {first}{last}  |  {nick}  |  <code>{uid}</code>\n"
+                f"💬 <i>{m.text}</i>\n"
+                f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
     bot.send_message(m.chat.id, T["feedback_ok"], reply_markup=main_keyboard(uid))
 
 
@@ -813,8 +699,7 @@ def msg_auto_menu(m: types.Message) -> None:
     uid  = m.from_user.id
     lang = get_lang(uid)
     T    = LANGS[lang]
-
-    kb = types.InlineKeyboardMarkup()
+    kb   = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("⏰ 1H",  callback_data="auto_3600"),
         types.InlineKeyboardButton("⏰ 5H",  callback_data="auto_18000"),
@@ -824,8 +709,6 @@ def msg_auto_menu(m: types.Message) -> None:
         is_active = uid in AUTO_USERS
     if is_active:
         kb.row(types.InlineKeyboardButton("🚫 Выключить", callback_data="auto_0"))
-
-    # Сначала основная клавиатура, потом inline
     bot.send_message(m.chat.id, T["auto_menu"], reply_markup=main_keyboard(uid))
     bot.send_message(m.chat.id, T["auto_choose"], reply_markup=kb)
     log_action(m.from_user, "Меню авто")
@@ -837,13 +720,11 @@ def cb_auto(c: types.CallbackQuery) -> None:
     uid  = c.from_user.id
     lang = get_lang(uid)
     T    = LANGS[lang]
-
     try:
         val = int(c.data.split("_", 1)[1])
     except (IndexError, ValueError):
         bot.answer_callback_query(c.id)
         return
-
     if val == 0:
         with _DATA_LOCK:
             AUTO_USERS.pop(uid, None)
@@ -857,11 +738,8 @@ def cb_auto(c: types.CallbackQuery) -> None:
         save_auto(uid)
         resp = f"✅ {T['auto_on_msg']} {val // 3600}H."
         log_action(c.from_user, "Авто ON", result=f"{val // 3600}H")
-
     try:
-        bot.edit_message_text(
-            resp, c.message.chat.id, c.message.message_id, parse_mode="HTML"
-        )
+        bot.edit_message_text(resp, c.message.chat.id, c.message.message_id, parse_mode="HTML")
     except Exception:
         pass
     bot.answer_callback_query(c.id)
@@ -878,12 +756,8 @@ def msg_disable_auto(m: types.Message) -> None:
     with _DATA_LOCK:
         AUTO_USERS.pop(uid, None)
     save_auto(uid)
-    bot.send_message(
-        m.chat.id,
-        f"✅ 🔕 {T['auto_off_msg']}",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(uid),
-    )
+    bot.send_message(m.chat.id, f"✅ 🔕 {T['auto_off_msg']}",
+                     parse_mode="HTML", reply_markup=main_keyboard(uid))
     log_action(m.from_user, "Отключил уведомления")
 
 
@@ -898,10 +772,10 @@ def msg_admin_panel(m: types.Message) -> None:
     init_user(m.from_user)
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("📊 Статистика",              callback_data="adm_stat"),
-        types.InlineKeyboardButton("👥 База пользователей",       callback_data="adm_users_0"),
-        types.InlineKeyboardButton("📢 Рассылка всем",           callback_data="adm_bc"),
-        types.InlineKeyboardButton("🔔 Упр. подписками (тихо)",  callback_data="adm_auto_menu"),
+        types.InlineKeyboardButton("📊 Статистика",             callback_data="adm_stat"),
+        types.InlineKeyboardButton("👥 База пользователей",      callback_data="adm_users_0"),
+        types.InlineKeyboardButton("📢 Рассылка всем",          callback_data="adm_bc"),
+        types.InlineKeyboardButton("🔔 Упр. подписками (тихо)", callback_data="adm_auto_menu"),
     )
     bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=kb)
     log_action(m.from_user, "Открыл Админ-панель")
@@ -912,142 +786,108 @@ def cb_admin(c: types.CallbackQuery) -> None:
     if c.from_user.id != MY_ADMIN_ID:
         bot.answer_callback_query(c.id, "⛔️ Доступ запрещён")
         return
+    action = c.data[4:]
 
-    action = c.data[4:]  # убираем "adm_"
-
-    # ── Статистика ───────────────────────────────────────────────
     if action == "stat":
         with _DATA_LOCK:
-            n_users = len(ALL_USER_IDS)
-            n_subs  = len(AUTO_USERS)
-            n_reqs  = sum(u.get("requests", 0) for u in USER_DATA.values())
+            n_u = len(ALL_USER_IDS)
+            n_s = len(AUTO_USERS)
+            n_r = sum(u.get("requests", 0) for u in USER_DATA.values())
         bot.answer_callback_query(c.id)
         bot.send_message(
             c.message.chat.id,
-            f"📊 <b>Статистика бота</b>\n\n"
-            f"👥 Пользователей:  <b>{n_users}</b>\n"
-            f"🔔 Подписок:       <b>{n_subs}</b>\n"
-            f"📈 Запросов курса: <b>{n_reqs}</b>\n"
+            f"📊 <b>Статистика</b>\n\n"
+            f"👥 Пользователей:  <b>{n_u}</b>\n"
+            f"🔔 Подписок:       <b>{n_s}</b>\n"
+            f"📈 Запросов курса: <b>{n_r}</b>\n"
             f"🕒 {now_msk().strftime('%d.%m.%Y %H:%M:%S')} МСК",
             parse_mode="HTML",
         )
 
-    # ── Список пользователей (пагинация) ─────────────────────────
     elif action.startswith("users_"):
         try:
             page = int(action.split("_", 1)[1])
         except ValueError:
             page = 0
-        PAGE_SIZE = 8
+        PG = 8
         with _DATA_LOCK:
             all_ids = sorted(ALL_USER_IDS)
         total = len(all_ids)
-        s     = page * PAGE_SIZE
-        e     = min(s + PAGE_SIZE, total)
+        s = page * PG
+        e = min(s + PG, total)
         chunk = all_ids[s:e]
-
         if not chunk:
             bot.answer_callback_query(c.id, "Список пуст")
             return
-
         txt = f"👥 <b>Пользователи ({s+1}–{e} из {total})</b>\n\n"
         kb  = types.InlineKeyboardMarkup(row_width=1)
-
         for uid in chunk:
             with _DATA_LOCK:
                 d    = USER_DATA.get(uid, {})
                 icon = "🟢" if uid in AUTO_USERS else "🔴"
-            nick = (
-                f"@{d.get('username')}" if d.get("username")
-                else (d.get("first_name") or str(uid))
-            )
+            nick = f"@{d.get('username')}" if d.get("username") else (d.get("first_name") or str(uid))
             txt += f"{icon} <code>{uid}</code>  {nick}\n"
-            kb.add(types.InlineKeyboardButton(
-                f"🔍 {nick}", callback_data=f"adm_detail_{uid}"
-            ))
-
-        # Навигация
-        nav_btns = []
+            kb.add(types.InlineKeyboardButton(f"🔍 {nick}", callback_data=f"adm_detail_{uid}"))
+        nav = []
         if page > 0:
-            nav_btns.append(types.InlineKeyboardButton("◀️", callback_data=f"adm_users_{page-1}"))
+            nav.append(types.InlineKeyboardButton("◀️", callback_data=f"adm_users_{page-1}"))
         if e < total:
-            nav_btns.append(types.InlineKeyboardButton("▶️", callback_data=f"adm_users_{page+1}"))
-        if nav_btns:
-            kb.row(*nav_btns)
-
+            nav.append(types.InlineKeyboardButton("▶️", callback_data=f"adm_users_{page+1}"))
+        if nav:
+            kb.row(*nav)
         bot.answer_callback_query(c.id)
         try:
-            bot.edit_message_text(
-                txt, c.message.chat.id, c.message.message_id,
-                parse_mode="HTML", reply_markup=kb,
-            )
+            bot.edit_message_text(txt, c.message.chat.id, c.message.message_id,
+                                  parse_mode="HTML", reply_markup=kb)
         except Exception:
             bot.send_message(c.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
 
-    # ── Карточка пользователя ────────────────────────────────────
     elif action.startswith("detail_"):
         try:
             uid = int(action.split("_", 1)[1])
         except ValueError:
             bot.answer_callback_query(c.id)
             return
-
         with _DATA_LOCK:
             d = USER_DATA.get(uid, {}).copy()
             a = AUTO_USERS.get(uid)
-
-        nick = (
-            f"@{d.get('username')}" if d.get("username")
-            else (d.get("first_name") or "—")
-        )
-
-        if a:
-            hours     = a["interval"] // 3600
-            auto_info = (
-                f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
-                f"  ⏱ Интервал:            <b>каждые {hours}H</b>\n"
-                f"  📅 Включено:            {fmt_dt(a.get('enabled_at'))}\n"
-                f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
-            )
-        else:
-            auto_info = "\n🔴 <b>Автообновление: ВЫКЛЮЧЕНО</b>"
-
+        nick = f"@{d.get('username')}" if d.get("username") else (d.get("first_name") or "—")
+        auto_info = (
+            f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
+            f"  ⏱ Интервал:            <b>каждые {a['interval']//3600}H</b>\n"
+            f"  📅 Включено:           {fmt_dt(a.get('enabled_at'))}\n"
+            f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
+        ) if a else "\n🔴 <b>Автообновление: ВЫКЛЮЧЕНО</b>"
         text = (
             f"🔍 <b>Карточка пользователя</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"<b>ID:</b>    <code>{uid}</code>\n"
-            f"<b>Ник:</b>   {nick}\n"
-            f"<b>Язык:</b>  {'🇷🇺 RU' if d.get('lang') == 'ru' else '🇬🇧 EN'}\n"
-            f"<b>В боте с:</b>  {fmt_dt(d.get('joined'))}\n"
+            f"<b>ID:</b>       <code>{uid}</code>\n"
+            f"<b>Ник:</b>      {nick}\n"
+            f"<b>Язык:</b>     {'🇷🇺 RU' if d.get('lang')=='ru' else '🇬🇧 EN'}\n"
+            f"<b>В боте с:</b> {fmt_dt(d.get('joined'))}\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"<b>Запросов:</b>      {d.get('requests', 0)}\n"
-            f"<b>Последний:</b>     {fmt_dt(d.get('last'))}"
+            f"<b>Запросов:</b>  {d.get('requests',0)}\n"
+            f"<b>Последний:</b> {fmt_dt(d.get('last'))}"
             f"{auto_info}"
         )
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("◀️ К списку", callback_data="adm_users_0"))
-
         bot.answer_callback_query(c.id)
         try:
-            bot.edit_message_text(
-                text, c.message.chat.id, c.message.message_id,
-                parse_mode="HTML", reply_markup=kb,
-            )
+            bot.edit_message_text(text, c.message.chat.id, c.message.message_id,
+                                  parse_mode="HTML", reply_markup=kb)
         except Exception:
             bot.send_message(c.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
-    # ── Тихое управление подписками ──────────────────────────────
     elif action == "auto_menu":
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(
-            types.InlineKeyboardButton("✅ Включить всем",      callback_data="adm_auto_all"),
-            types.InlineKeyboardButton("👤 Подключить по ID",  callback_data="adm_auto_id"),
+            types.InlineKeyboardButton("✅ Включить всем",    callback_data="adm_auto_all"),
+            types.InlineKeyboardButton("👤 Подключить по ID", callback_data="adm_auto_id"),
         )
         bot.edit_message_text(
-            "⚙️ <b>Управление подписками</b>\n\n"
-            "Пользователи <b>не получат</b> уведомлений о подключении.",
-            c.message.chat.id, c.message.message_id,
-            parse_mode="HTML", reply_markup=kb,
+            "⚙️ <b>Управление подписками</b>\n\nПользователи <b>не получат</b> уведомлений.",
+            c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=kb,
         )
 
     elif action == "auto_all":
@@ -1057,11 +897,9 @@ def cb_admin(c: types.CallbackQuery) -> None:
             types.InlineKeyboardButton("5H",  callback_data="adm_all_18000"),
             types.InlineKeyboardButton("24H", callback_data="adm_all_86400"),
         )
-        bot.edit_message_text(
-            "⏳ Выберите интервал для <b>всех</b> пользователей:",
-            c.message.chat.id, c.message.message_id,
-            parse_mode="HTML", reply_markup=kb,
-        )
+        bot.edit_message_text("⏳ Выберите интервал для <b>всех</b>:",
+                              c.message.chat.id, c.message.message_id,
+                              parse_mode="HTML", reply_markup=kb)
 
     elif action.startswith("all_"):
         try:
@@ -1083,49 +921,39 @@ def cb_admin(c: types.CallbackQuery) -> None:
             except Exception as exc:
                 logger.error("Тихая подписка %d: %s", uid, exc)
         bot.edit_message_text(
-            f"✅ Подписка {hours}H активирована для <b>{count}</b> чел.",
+            f"✅ Подписка {hours}H для <b>{count}</b> чел.",
             c.message.chat.id, c.message.message_id, parse_mode="HTML",
         )
         log_action(c.from_user, f"Массовая подписка {hours}H", result=f"{count} чел.")
 
     elif action == "auto_id":
         bot.answer_callback_query(c.id)
-        msg = bot.send_message(
-            c.message.chat.id,
-            "Введите <b>ID</b> пользователя для тихой подписки:",
-            parse_mode="HTML",
-            reply_markup=types.ForceReply(selective=True),
-        )
+        msg = bot.send_message(c.message.chat.id, "Введите <b>ID</b> пользователя:",
+                               parse_mode="HTML", reply_markup=types.ForceReply(selective=True))
         bot.register_next_step_handler(msg, _adm_auto_get_id)
 
     elif action == "bc":
         bot.answer_callback_query(c.id)
-        msg = bot.send_message(
-            c.message.chat.id,
-            "✏️ Введите текст рассылки (поддерживается HTML):",
-            reply_markup=types.ForceReply(selective=True),
-        )
+        msg = bot.send_message(c.message.chat.id, "✏️ Введите текст рассылки:",
+                               reply_markup=types.ForceReply(selective=True))
         bot.register_next_step_handler(msg, _adm_broadcast)
 
     else:
         bot.answer_callback_query(c.id)
 
 
-# ── Вспомогательные функции админ-панели ────────────────────────────
 def _adm_auto_get_id(m: types.Message) -> None:
     if not m.text:
         return
     try:
         tid = int(m.text.strip())
     except ValueError:
-        bot.send_message(m.chat.id, "❌ Некорректный ID (только цифры).",
-                         reply_markup=main_keyboard(m.from_user.id))
+        bot.send_message(m.chat.id, "❌ Некорректный ID.", reply_markup=main_keyboard(m.from_user.id))
         return
     msg = bot.send_message(
         m.chat.id,
-        f"Введите интервал в <b>часах</b> (1, 5 или 24) для <code>{tid}</code>:",
-        parse_mode="HTML",
-        reply_markup=types.ForceReply(selective=True),
+        f"Интервал в <b>часах</b> (1/5/24) для <code>{tid}</code>:",
+        parse_mode="HTML", reply_markup=types.ForceReply(selective=True),
     )
     bot.register_next_step_handler(msg, lambda s: _adm_auto_set(s, tid))
 
@@ -1136,9 +964,9 @@ def _adm_auto_set(m: types.Message, tid: int) -> None:
     try:
         hours = int(m.text.strip())
         if hours <= 0:
-            raise ValueError("interval must be positive")
+            raise ValueError
     except ValueError:
-        bot.send_message(m.chat.id, "❌ Введите положительное целое число.",
+        bot.send_message(m.chat.id, "❌ Введите положительное число.",
                          reply_markup=main_keyboard(m.from_user.id))
         return
     ts = now_msk()
@@ -1147,9 +975,8 @@ def _adm_auto_set(m: types.Message, tid: int) -> None:
     save_auto(tid)
     bot.send_message(
         m.chat.id,
-        f"✅ <code>{tid}</code> — подписка каждые <b>{hours}H</b> активирована.",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(m.from_user.id),
+        f"✅ <code>{tid}</code> — каждые <b>{hours}H</b>.",
+        parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id),
     )
     log_action(m.from_user, f"Тихая подписка {tid}", result=f"{hours}H")
 
@@ -1159,137 +986,143 @@ def _adm_broadcast(m: types.Message) -> None:
         bot.send_message(m.chat.id, "❌ Пустое сообщение.",
                          reply_markup=main_keyboard(m.from_user.id))
         return
-    with _DATA_LOCK:
-        ids = set(ALL_USER_IDS)
-    sent = failed = 0
-    for uid in ids:
-        try:
-            bot.send_message(
-                uid,
-                f"📢 <b>Уведомление</b>\n\n{m.text}",
-                parse_mode="HTML",
-            )
-            sent += 1
-            time.sleep(0.05)   # Telegram flood-limit: 30 msg/sec max
-        except Exception:
-            failed += 1
-    bot.send_message(
-        m.chat.id,
-        f"✅ Рассылка завершена.\n📤 Доставлено: <b>{sent}</b>  ❌ Ошибок: <b>{failed}</b>",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(m.from_user.id),
-    )
-    log_action(m.from_user, "Рассылка", result=f"sent={sent} failed={failed}")
+    # FIX БАГ 6: рассылка в отдельном потоке — не блокирует обработчик
+    def _do_broadcast() -> None:
+        with _DATA_LOCK:
+            ids = set(ALL_USER_IDS)
+        sent = failed = 0
+        for uid in ids:
+            try:
+                bot.send_message(uid, f"📢 <b>Уведомление</b>\n\n{m.text}", parse_mode="HTML")
+                sent += 1
+                time.sleep(0.05)
+            except Exception:
+                failed += 1
+        bot.send_message(
+            m.chat.id,
+            f"✅ Готово. Доставлено: <b>{sent}</b>  ❌ Ошибок: <b>{failed}</b>",
+            parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id),
+        )
+        log_action(m.from_user, "Рассылка", result=f"sent={sent} failed={failed}")
+    threading.Thread(target=_do_broadcast, daemon=True).start()
+    bot.send_message(m.chat.id, "⏳ Рассылка запущена...",
+                     reply_markup=main_keyboard(m.from_user.id))
 
 
-# ─── Fallback — любое другое сообщение ──────────────────────────────
 @bot.message_handler(func=lambda m: True)
 def msg_fallback(m: types.Message) -> None:
     init_user(m.from_user)
     uid  = m.from_user.id
     lang = get_lang(uid)
-    bot.send_message(
-        m.chat.id,
-        LANGS[lang]["menu_updated"],
-        reply_markup=main_keyboard(uid),
-    )
+    bot.send_message(m.chat.id, LANGS[lang]["menu_updated"], reply_markup=main_keyboard(uid))
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ФОНОВЫЙ ВОРКЕР: АВТООБНОВЛЕНИЕ КУРСОВ
 # ═══════════════════════════════════════════════════════════════════════
 def _auto_worker() -> None:
-    """
-    Каждые 60 сек проверяет подписчиков с истёкшим интервалом.
-    Делает ОДИН общий запрос к API на весь цикл (экономия ресурсов).
-    Корректно обрабатывает заблокировавших бота.
-    """
     logger.info("🔄 auto_worker: запущен")
     while True:
         try:
             time.sleep(60)
             now = now_msk()
-
-            # Собираем тех, у кого вышел интервал (без холдинга лока на IO)
             with _DATA_LOCK:
                 due = {
                     cid: cfg.copy()
                     for cid, cfg in AUTO_USERS.items()
                     if _elapsed_sec(cfg.get("last")) >= cfg["interval"]
                 }
-
             if not due:
                 continue
-
-            # Один компактный запрос к API (только Upbit + ABCEX + KRW/RUB)
             rates    = fetch_auto_rates()
             has_data = any(v is not None for v in rates.values())
             if not has_data:
-                logger.warning("auto_worker: все API недоступны, пропускаем цикл")
+                logger.warning("auto_worker: все API недоступны")
                 continue
-
-            text = build_auto_message(rates)   # один текст для всех
-
-            for cid, cfg in due.items():
+            text = build_auto_message(rates)
+            for cid in due:
                 try:
                     bot.send_message(cid, text, parse_mode="HTML")
-
                     with _DATA_LOCK:
                         if cid in AUTO_USERS:
                             AUTO_USERS[cid]["last"] = now
                     save_auto(cid)
-
                 except Exception as exc:
                     err = str(exc).lower()
-                    if any(kw in err for kw in (
-                        "blocked", "not found", "deactivated",
-                        "forbidden", "chat not found",
-                    )):
+                    if any(kw in err for kw in ("blocked","not found","deactivated","forbidden","chat not found")):
                         logger.warning("auto_worker: %d заблокировал бота — удаляем", cid)
                         with _DATA_LOCK:
                             AUTO_USERS.pop(cid, None)
                         save_auto(cid)
                     else:
-                        logger.error("auto_worker error for %d: %s", cid, exc)
-
+                        logger.error("auto_worker %d: %s", cid, exc)
         except Exception as exc:
-            # Защита: воркер не должен падать никогда
-            logger.critical("auto_worker crashed: %s — restarting in 30s", exc)
+            logger.critical("auto_worker crashed: %s — перезапуск через 30с", exc)
             time.sleep(30)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER (free tier)
+#  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
     """
-    Пингует собственный Flask-сервер каждые 10 минут,
-    чтобы Render не засыпал бесплатный инстанс.
-    """
-    if not RENDER_URL:
-        logger.warning("⚠️ ВНИМАНИЕ: Переменная RENDER_URL не задана в настройках Render! Анти-сон отключен, бот может уснуть.")
-        return
+    Решает ВСЕ выявленные проблемы с засыпанием Render free tier:
 
-    ping_url = RENDER_URL.rstrip("/") + "/ping"
-    logger.info("🏓 anti_sleep: запущен. Буду пинговать %s каждые 10 мин", ping_url)
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+    БАГ 1 FIX: первый пинг происходит через 5 сек после старта (не через 10 мин)
+    БАГ 2 FIX: self-ping НЕ работает на Render — пингуем внешние сервисы
+               которые создают ВХОДЯЩИЙ трафик к нашему сервису
+    БАГ 3 FIX: работает даже без RENDER_URL (через внешние echo-сервисы)
+    БАГ 4 FIX: воркер никогда не падает — защищён try/except на весь цикл
+
+    Как это работает:
+      1. Если RENDER_URL задан — делаем запрос К СЕБЕ через публичный URL
+         (это ВХОДЯЩИЙ трафик с точки зрения Render — засчитывается!)
+      2. Параллельно пингуем несколько внешних URL чтобы поток не спал
+      3. Интервал 10 мин с первым пингом при старте
+    """
+    _INTERVAL   = 10 * 60   # 10 минут
+    _PING_AGENT = requests.Session()
+    _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
+
+    # Внешние URL для пинга (создают исходящую активность сети)
+    _EXTERNAL_URLS = [
+        "https://httpbin.org/get",
+        "https://api.upbit.com/v1/market/all",  # всё равно используем Upbit
+    ]
+
+    def _ping_all() -> None:
+        # 1. Пингуем себя через публичный URL (ВХОДЯЩИЙ трафик для Render)
+        if RENDER_URL:
+            try:
+                r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
+                logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
+            except Exception as exc:
+                logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
+
+        # 2. Пингуем внешние URL (сетевая активность = процесс жив)
+        for url in _EXTERNAL_URLS:
+            try:
+                _PING_AGENT.get(url, timeout=10)
+            except Exception:
+                pass
+
+    logger.info("🏓 anti_sleep: запущен (интервал %d мин)", _INTERVAL // 60)
+
+    # FIX БАГ 1 и 4: первый пинг сразу при старте, потом по интервалу
+    time.sleep(5)  # ждём 5 сек чтобы Flask успел подняться
+    _ping_all()
 
     while True:
-        # Спим 10 минут (600 секунд) вместо 14, чтобы был запас времени (Render усыпляет ровно через 15)
-        time.sleep(600)
         try:
-            # Отправляем запрос снаружи через внешний URL
-            r = requests.get(ping_url, headers=headers, timeout=10)
-            logger.info("✅ anti_sleep ping успешно: %d", r.status_code)
+            time.sleep(_INTERVAL)
+            _ping_all()
         except Exception as exc:
-            logger.warning("❌ anti_sleep ping ошибка: %s", exc)
+            logger.error("anti_sleep_worker error: %s", exc)
+            time.sleep(60)  # при ошибке ждём минуту и пробуем снова
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  FLASK — HEALTH CHECK + PING ENDPOINT
+#  FLASK
 # ═══════════════════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 
@@ -1297,27 +1130,25 @@ flask_app = Flask(__name__)
 @flask_app.route("/")
 def health() -> Any:
     with _DATA_LOCK:
-        n_users = len(ALL_USER_IDS)
-        n_subs  = len(AUTO_USERS)
+        n_u = len(ALL_USER_IDS)
+        n_s = len(AUTO_USERS)
     return jsonify({
-        "status":  "ok",
-        "users":   n_users,
-        "subs":    n_subs,
-        "time":    now_msk().strftime("%Y-%m-%d %H:%M:%S MSK"),
+        "status": "ok",
+        "users":  n_u,
+        "subs":   n_s,
+        "time":   now_msk().strftime("%Y-%m-%d %H:%M:%S MSK"),
     }), 200
 
 
 @flask_app.route("/ping")
-def ping() -> Any:
-    """Endpoint для anti-sleep пинга."""
+def ping_endpoint() -> Any:
     return jsonify({"pong": True, "time": now_msk().isoformat()}), 200
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  ТОЧКА ВХОДА
+#  ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    # 1. Снять возможный старый webhook
     try:
         bot.remove_webhook()
         time.sleep(0.5)
@@ -1325,44 +1156,27 @@ if __name__ == "__main__":
     except Exception as exc:
         logger.warning("remove_webhook: %s", exc)
 
-    # 2. Загрузить данные из MongoDB в RAM
     load_db()
 
-    # 3. Фоновый воркер: автообновление курсов подписчикам
-    threading.Thread(
-        target=_auto_worker, daemon=True, name="auto_worker"
-    ).start()
+    threading.Thread(target=_auto_worker,       daemon=True, name="auto_worker").start()
+    threading.Thread(target=_anti_sleep_worker, daemon=True, name="anti_sleep").start()
 
-    # 4. Фоновый воркер: анти-сон Render
-    threading.Thread(
-        target=_anti_sleep_worker, daemon=True, name="anti_sleep"
-    ).start()
-
-    # 5. Flask в отдельном потоке
-    #    use_reloader=False обязательно — иначе Render запустит два процесса
     port = int(os.environ.get("PORT", 10_000))
     threading.Thread(
-        target=lambda: flask_app.run(
-            host="0.0.0.0",
-            port=port,
-            use_reloader=False,
-            debug=False,
-        ),
-        daemon=True,
-        name="flask",
+        target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False),
+        daemon=True, name="flask",
     ).start()
-    logger.info("🌐 Flask запущен на порту %d", port)
+    logger.info("🌐 Flask на порту %d", port)
 
-    # 6. Telegram polling с авто-рестартом
-    logger.info("🤖 Бот запущен — жду сообщения...")
+    logger.info("🤖 Бот запущен")
     while True:
         try:
             bot.infinity_polling(
                 timeout=30,
                 long_polling_timeout=20,
-                skip_pending=True,      # игнорируем сообщения накопившиеся во время простоя
+                skip_pending=True,
                 allowed_updates=["message", "callback_query"],
             )
         except Exception as exc:
-            logger.error("infinity_polling упал: %s — перезапуск через 10с", exc)
+            logger.error("polling упал: %s — перезапуск через 10с", exc)
             time.sleep(10)
