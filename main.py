@@ -772,9 +772,9 @@ def msg_admin_panel(m: types.Message) -> None:
     init_user(m.from_user)
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("📊 Статистика",             callback_data="adm_stat"),
-        types.InlineKeyboardButton("👥 База пользователей",      callback_data="adm_users_0"),
-        types.InlineKeyboardButton("📢 Рассылка всем",          callback_data="adm_bc"),
+        types.InlineKeyboardButton("📊 Статистика",              callback_data="adm_stat"),
+        types.InlineKeyboardButton("👥 База пользователей",       callback_data="adm_users_0"),
+        types.InlineKeyboardButton("📢 Рассылка всем",           callback_data="adm_bc"),
         types.InlineKeyboardButton("🔔 Упр. подписками (тихо)", callback_data="adm_auto_menu"),
     )
     bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=kb)
@@ -855,7 +855,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
         auto_info = (
             f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
             f"  ⏱ Интервал:            <b>каждые {a['interval']//3600}H</b>\n"
-            f"  📅 Включено:           {fmt_dt(a.get('enabled_at'))}\n"
+            f"  📅 Включено:            {fmt_dt(a.get('enabled_at'))}\n"
             f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
         ) if a else "\n🔴 <b>Автообновление: ВЫКЛЮЧЕНО</b>"
         text = (
@@ -986,7 +986,6 @@ def _adm_broadcast(m: types.Message) -> None:
         bot.send_message(m.chat.id, "❌ Пустое сообщение.",
                          reply_markup=main_keyboard(m.from_user.id))
         return
-    # FIX БАГ 6: рассылка в отдельном потоке — не блокирует обработчик
     def _do_broadcast() -> None:
         with _DATA_LOCK:
             ids = set(ALL_USER_IDS)
@@ -1066,59 +1065,50 @@ def _auto_worker() -> None:
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
     """
-    Решает ВСЕ выявленные проблемы с засыпанием Render free tier:
-
-    БАГ 1 FIX: первый пинг происходит через 5 сек после старта (не через 10 мин)
-    БАГ 2 FIX: self-ping НЕ работает на Render — пингуем внешние сервисы
-               которые создают ВХОДЯЩИЙ трафик к нашему сервису
-    БАГ 3 FIX: работает даже без RENDER_URL (через внешние echo-сервисы)
-    БАГ 4 FIX: воркер никогда не падает — защищён try/except на весь цикл
-
-    Как это работает:
-      1. Если RENDER_URL задан — делаем запрос К СЕБЕ через публичный URL
-         (это ВХОДЯЩИЙ трафик с точки зрения Render — засчитывается!)
-      2. Параллельно пингуем несколько внешних URL чтобы поток не спал
-      3. Интервал 10 мин с первым пингом при старте
+    Решает ВСЕ выявленные проблемы с засыпанием Render free tier.
+    
+    1. Иллюзия исходящего трафика: Render не спит только от ВХОДЯЩЕГО трафика по публичному URL.
+    2. Кэширование балансировщика: Запросы /ping закэшируются балансировщиком Cloudflare. Добавлен параметр ?t=...
+    3. Маскировка заголовков: Firewall часто режет пустые пинги от скриптов Python. Добавлены реальные User-Agent.
     """
-    _INTERVAL   = 10 * 60   # 10 минут
+    _INTERVAL   = 10 * 60   # 10 минут (лимит Render - 15 мин, нужен запас)
     _PING_AGENT = requests.Session()
-    _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
+    
+    # Добавляем реальные заголовки браузера, чтобы пройти фаерволы Cloudflare/Render
+    _PING_AGENT.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
 
-    # Внешние URL для пинга (создают исходящую активность сети)
-    _EXTERNAL_URLS = [
-        "https://httpbin.org/get",
-        "https://api.upbit.com/v1/market/all",  # всё равно используем Upbit
-    ]
+    if not RENDER_URL:
+        logger.error("🚨 КРИТИЧЕСКАЯ ОШИБКА АНТИ-СНА: Переменная RENDER_URL не задана!")
+        logger.error("🚨 Бот УСНЕТ через 15 минут. Добавьте RENDER_URL (например, https://my-bot.onrender.com) в Environment Variables на Render.")
+        return 
 
-    def _ping_all() -> None:
-        # 1. Пингуем себя через публичный URL (ВХОДЯЩИЙ трафик для Render)
-        if RENDER_URL:
-            try:
-                r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
-                logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
-            except Exception as exc:
-                logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
+    def _ping_self() -> None:
+        try:
+            # Добавляем случайный параметр ?t=..., чтобы Render CDN гарантированно не кэшировал запрос
+            url = f"{RENDER_URL}/ping?t={int(time.time())}"
+            r = _PING_AGENT.get(url, timeout=15)
+            logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
+        except Exception as exc:
+            logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
 
-        # 2. Пингуем внешние URL (сетевая активность = процесс жив)
-        for url in _EXTERNAL_URLS:
-            try:
-                _PING_AGENT.get(url, timeout=10)
-            except Exception:
-                pass
+    logger.info("🏓 anti_sleep: запущен (интервал %d мин). Цель: %s", _INTERVAL // 60, RENDER_URL)
 
-    logger.info("🏓 anti_sleep: запущен (интервал %d мин)", _INTERVAL // 60)
-
-    # FIX БАГ 1 и 4: первый пинг сразу при старте, потом по интервалу
     time.sleep(5)  # ждём 5 сек чтобы Flask успел подняться
-    _ping_all()
+    _ping_self()
 
     while True:
         try:
             time.sleep(_INTERVAL)
-            _ping_all()
+            _ping_self()
         except Exception as exc:
             logger.error("anti_sleep_worker error: %s", exc)
-            time.sleep(60)  # при ошибке ждём минуту и пробуем снова
+            time.sleep(60)
 
 
 # ═══════════════════════════════════════════════════════════════════════
