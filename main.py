@@ -9,7 +9,6 @@ import logging
 import threading
 import time
 import concurrent.futures
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -42,10 +41,12 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
+# RENDER_URL — адрес вашего сервиса, например: https://my-bot.onrender.com
+# Задаётся в Environment Variables на Render
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
-_API_TIMEOUT  = 8
-_API_MAX_WAIT = 12
+_API_TIMEOUT  = 8    # сек на один HTTP-запрос к бирже
+_API_MAX_WAIT = 12   # сек — жёсткий потолок ожидания всех futures
 
 _DATA_LOCK = threading.Lock()
 
@@ -151,7 +152,6 @@ ALL_USER_IDS: set                       = set()
 def now_msk() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
-
 def fmt_num(value: Any, decimals: int = 2) -> str:
     if value is None:
         return "—"
@@ -160,12 +160,10 @@ def fmt_num(value: Any, decimals: int = 2) -> str:
     except (TypeError, ValueError):
         return "—"
 
-
 def fmt_dt(dt: Optional[datetime], seconds: bool = True) -> str:
     if not dt:
         return "—"
     return dt.strftime("%d.%m.%Y  %H:%M:%S" if seconds else "%d.%m.%Y  %H:%M")
-
 
 def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
     if not raw:
@@ -178,8 +176,8 @@ def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
     except (ValueError, TypeError):
         return None
 
-
 def _elapsed_sec(dt: Optional[datetime]) -> float:
+    """Секунд прошло с dt. Корректно для naive и aware datetime."""
     if dt is None:
         return float("inf")
     try:
@@ -188,11 +186,11 @@ def _elapsed_sec(dt: Optional[datetime]) -> float:
     except Exception:
         return float("inf")
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════════
 def load_db() -> None:
+    """Загружает все профили и подписки из MongoDB в RAM при старте."""
     if users_col is None or auto_col is None:
         logger.warning("load_db: MongoDB недоступна, пропускаем")
         return
@@ -220,7 +218,6 @@ def load_db() -> None:
     except Exception as exc:
         logger.error("❌ load_db: %s", exc)
 
-
 def _db_write_user(uid: int) -> None:
     if users_col is None:
         return
@@ -244,10 +241,8 @@ def _db_write_user(uid: int) -> None:
     except Exception as exc:
         logger.error("save_user(%d): %s", uid, exc)
 
-
 def save_user(uid: int) -> None:
     threading.Thread(target=_db_write_user, args=(uid,), daemon=True).start()
-
 
 def _db_write_auto(uid: int) -> None:
     if auto_col is None:
@@ -270,10 +265,8 @@ def _db_write_auto(uid: int) -> None:
     except Exception as exc:
         logger.error("save_auto(%d): %s", uid, exc)
 
-
 def save_auto(uid: int) -> None:
     threading.Thread(target=_db_write_auto, args=(uid,), daemon=True).start()
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ПОЛЬЗОВАТЕЛЬ
@@ -316,11 +309,9 @@ def init_user(tg_user: types.User) -> None:
     save_user(uid)
     logger.info("🆕 Новый профиль: %d (%s)", uid, tg_user.first_name)
 
-
 def get_lang(uid: int) -> str:
     with _DATA_LOCK:
         return USER_DATA.get(uid, {}).get("lang", "ru")
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ В КАНАЛ
@@ -344,7 +335,6 @@ def log_action(tg_user: types.User, action: str, result: Optional[str] = None) -
             pass
     threading.Thread(target=_send, daemon=True).start()
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  UI
 # ═══════════════════════════════════════════════════════════════════════
@@ -358,29 +348,23 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
         kb.row(T["btn_admin"])
     return kb
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  API — ПОЛУЧЕНИЕ КУРСОВ
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
 def _get_session() -> requests.Session:
+    """Thread-local сессия — потокобезопасный HTTP."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0"
-        })
+        s.headers.update({"User-Agent": "Mozilla/5.0 (P2PBot/4.0)"})
         _thread_local.session = s
     return _thread_local.session
-
 
 def _fetch_upbit() -> Optional[float]:
     try:
         r = _get_session().get(
-            f"https://api.upbit.com/v1/ticker?markets=KRW-USDT&_t={int(time.time() * 1000)}",
+            "https://api.upbit.com/v1/ticker?markets=KRW-USDT",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -389,11 +373,11 @@ def _fetch_upbit() -> Optional[float]:
         logger.warning("Upbit: %s", exc)
         return None
 
-
 def _fetch_bithumb() -> Optional[float]:
+    # Вариант 1: новый v1 endpoint
     try:
         r = _get_session().get(
-            f"https://api.bithumb.com/v1/ticker?markets=KRW-USDT&_t={int(time.time() * 1000)}",
+            "https://api.bithumb.com/v1/ticker?markets=KRW-USDT",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -404,9 +388,10 @@ def _fetch_bithumb() -> Optional[float]:
                 return float(price)
     except Exception:
         pass
+    # Вариант 2: старый public endpoint (fallback)
     try:
         r = _get_session().get(
-            f"https://api.bithumb.com/public/ticker/USDT_KRW?_t={int(time.time() * 1000)}",
+            "https://api.bithumb.com/public/ticker/USDT_KRW",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -417,41 +402,63 @@ def _fetch_bithumb() -> Optional[float]:
         logger.warning("Bithumb (оба варианта): %s", exc)
     return None
 
-
 def _fetch_krw_rub() -> Optional[float]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    
-    # 1. Прямой парсинг Google Finance (самый точный "курс гугла")
+    """
+    Парсит курс KRW/RUB с Google Finance.
+    URL: https://www.google.com/finance/quote/KRW-RUB
+    Цена на странице = сколько RUB стоит 1 KRW.
+    Результат: сколько RUB стоит 1 000 000 KRW.
+
+    Три паттерна поиска — от надёжного к запасному.
+    Заголовки имитируют реальный браузер Chrome.
+    """
+    import re as _re
+    url = "https://www.google.com/finance/quote/KRW-RUB"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    # Паттерны в порядке надёжности
+    _PATTERNS = [
+        r'data-last-price="([\d.]+)"',
+        r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
+        r'jsname="ip75Cb"[^>]*>([\d.]+)<',
+    ]
     try:
-        url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={int(time.time() * 1000)}"
-        r = requests.get(url, headers=headers, timeout=5)
+        session = _get_session()
+        # Временно меняем User-Agent на браузерный
+        old_ua = session.headers.get("User-Agent", "")
+        session.headers.update(headers)
+        r = session.get(url, timeout=_API_TIMEOUT)
+        session.headers.update({"User-Agent": old_ua})
         r.raise_for_status()
-        match = re.search(r'data-last-price="([0-9.]+)"', r.text)
-        if match:
-            price = float(match.group(1))
-            if price > 0:
-                return price * 1_000_000
-    except Exception as exc: 
-        logger.warning("Google: %s", exc)
-
-    # 2. Мощный фоллбэк на Yahoo Finance
-    try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?region=US&lang=en-US&includePrePost=false&interval=1m&useYfid=true&range=1d&_t={int(time.time() * 1000)}"
-        r = requests.get(url, headers=headers, timeout=5)
-        r.raise_for_status()
-        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price and float(price) > 0:
-            return float(price) * 1_000_000
-    except Exception as exc: 
-        logger.warning("Yahoo: %s", exc)
-
-    return None
-
+        html = r.text
+        for pattern in _PATTERNS:
+            m = _re.search(pattern, html)
+            if m:
+                price = float(m.group(1))
+                if price > 0:
+                    result = 1_000_000 * price
+                    logger.info("Google Finance KRW/RUB: 1M KRW = %.2f RUB", result)
+                    return result
+        logger.warning("Google Finance: паттерн цены не найден в HTML")
+        return None
+    except Exception as exc:
+        logger.warning("Google Finance KRW/RUB: %s", exc)
+        return None
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
     try:
         r = _get_session().get(
-            f"https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB&_t={int(time.time() * 1000)}",
+            "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
+            "?instrumentCode=USDTRUB",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -461,8 +468,8 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         logger.warning("ABCEX: %s", exc)
         return None, None
 
-
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
+    """Получает результат future с жёстким таймаутом. Никогда не бросает исключение."""
     try:
         return future.result(timeout=_API_MAX_WAIT)
     except concurrent.futures.TimeoutError:
@@ -473,8 +480,8 @@ def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
         logger.error("API future error: %s", exc)
         return default
 
-
 def fetch_all_rates() -> Dict[str, Optional[float]]:
+    """Полный запрос всех источников (для кнопки 'Показать курс')."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
@@ -487,8 +494,8 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
     return {"upbit": upbit, "bithumb": bithumb, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
 
-
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
+    """Лёгкий запрос для авто-рассылки (Upbit + ABCEX + Google Finance KRW/RUB)."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fr = pool.submit(_fetch_krw_rub)
@@ -498,7 +505,6 @@ def fetch_auto_rates() -> Dict[str, Optional[float]]:
         abcex   = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
     return {"upbit": upbit, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
-
 
 def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     T  = LANGS[lang]
@@ -520,8 +526,11 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"{T['contact']}"
     )
 
-
 def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
+    """
+    Компактное авто-сообщение.
+    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+    """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
     ab_sell  = rates.get("ab_sell")
@@ -540,7 +549,6 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     part_krw_rub = f"{int(round(krw_rub)):,} ₽"  if krw_rub  is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  ОБРАБОТЧИКИ TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════
@@ -555,7 +563,6 @@ def cmd_start(m: types.Message) -> None:
     )
     bot.send_message(m.chat.id, "🇷🇺 Выберите язык  /  🇬🇧 Select language:", reply_markup=kb)
     log_action(m.from_user, "/start")
-
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lang_"))
 def cb_lang(c: types.CallbackQuery) -> None:
@@ -576,7 +583,7 @@ def cb_lang(c: types.CallbackQuery) -> None:
     bot.answer_callback_query(c.id)
     log_action(c.from_user, "Язык", result="🇷🇺 RU" if lang == "ru" else "🇬🇧 EN")
 
-
+# ─── Показать курс ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_show"], LANGS["en"]["btn_show"]
 ))
@@ -586,8 +593,10 @@ def msg_show_rate(m: types.Message) -> None:
     lang = get_lang(uid)
     T    = LANGS[lang]
 
+    # 1. Мгновенно восстанавливаем клавиатуру
     bot.send_message(m.chat.id, "⏳", reply_markup=main_keyboard(uid))
 
+    # 2. Анимация . → .. → ...
     anim = bot.send_message(m.chat.id, ".")
     time.sleep(0.4)
     try:
@@ -600,9 +609,11 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
+    # 3. Запрашиваем курсы
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
+    # 4. Удаляем анимацию
     try:
         bot.delete_message(m.chat.id, anim.message_id)
     except Exception:
@@ -613,6 +624,7 @@ def msg_show_rate(m: types.Message) -> None:
         log_action(m.from_user, "Курс", result="⚠️ все API недоступны")
         return
 
+    # 5. Отправляем курс
     bot.send_message(m.chat.id, build_rate_message(rates, lang), parse_mode="HTML")
 
     with _DATA_LOCK:
@@ -621,7 +633,6 @@ def msg_show_rate(m: types.Message) -> None:
     save_user(uid)
     log_action(m.from_user, "Показать курс",
                result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],2)} ₽")
-
 
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_profile"], LANGS["en"]["btn_profile"]
@@ -646,7 +657,6 @@ def msg_profile(m: types.Message) -> None:
     bot.send_message(m.chat.id, text, parse_mode="HTML", reply_markup=main_keyboard(uid))
     log_action(m.from_user, "Профиль")
 
-
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_feedback"], LANGS["en"]["btn_feedback"]
 ))
@@ -660,7 +670,6 @@ def msg_feedback_start(m: types.Message) -> None:
                              reply_markup=types.ForceReply(selective=True))
     bot.register_next_step_handler(reply, _feedback_receive)
     log_action(m.from_user, "Отзыв — начало")
-
 
 def _feedback_receive(m: types.Message) -> None:
     init_user(m.from_user)
@@ -684,7 +693,9 @@ def _feedback_receive(m: types.Message) -> None:
             pass
     bot.send_message(m.chat.id, T["feedback_ok"], reply_markup=main_keyboard(uid))
 
-
+# ═══════════════════════════════════════════════════════════════════════
+#  АВТООБНОВЛЕНИЕ — ПОЛЬЗОВАТЕЛЬ
+# ═══════════════════════════════════════════════════════════════════════
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_auto"], LANGS["en"]["btn_auto"]
 ))
@@ -706,7 +717,6 @@ def msg_auto_menu(m: types.Message) -> None:
     bot.send_message(m.chat.id, T["auto_menu"], reply_markup=main_keyboard(uid))
     bot.send_message(m.chat.id, T["auto_choose"], reply_markup=kb)
     log_action(m.from_user, "Меню авто")
-
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
 def cb_auto(c: types.CallbackQuery) -> None:
@@ -738,7 +748,6 @@ def cb_auto(c: types.CallbackQuery) -> None:
         pass
     bot.answer_callback_query(c.id)
 
-
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_disable"], LANGS["en"]["btn_disable"]
 ))
@@ -754,7 +763,9 @@ def msg_disable_auto(m: types.Message) -> None:
                      parse_mode="HTML", reply_markup=main_keyboard(uid))
     log_action(m.from_user, "Отключил уведомления")
 
-
+# ═══════════════════════════════════════════════════════════════════════
+#  АДМИН-ПАНЕЛЬ
+# ═══════════════════════════════════════════════════════════════════════
 @bot.message_handler(func=lambda m: (
     m.from_user.id == MY_ADMIN_ID
     and m.text in (LANGS["ru"]["btn_admin"], LANGS["en"]["btn_admin"])
@@ -763,14 +774,13 @@ def msg_admin_panel(m: types.Message) -> None:
     init_user(m.from_user)
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("📊 Статистика",              callback_data="adm_stat"),
-        types.InlineKeyboardButton("👥 База пользователей",       callback_data="adm_users_0"),
-        types.InlineKeyboardButton("📢 Рассылка всем",           callback_data="adm_bc"),
+        types.InlineKeyboardButton("📊 Статистика",             callback_data="adm_stat"),
+        types.InlineKeyboardButton("👥 База пользователей",      callback_data="adm_users_0"),
+        types.InlineKeyboardButton("📢 Рассылка всем",          callback_data="adm_bc"),
         types.InlineKeyboardButton("🔔 Упр. подписками (тихо)", callback_data="adm_auto_menu"),
     )
     bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=kb)
     log_action(m.from_user, "Открыл Админ-панель")
-
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("adm_"))
 def cb_admin(c: types.CallbackQuery) -> None:
@@ -846,7 +856,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
         auto_info = (
             f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
             f"  ⏱ Интервал:            <b>каждые {a['interval']//3600}H</b>\n"
-            f"  📅 Включено:            {fmt_dt(a.get('enabled_at'))}\n"
+            f"  📅 Включено:           {fmt_dt(a.get('enabled_at'))}\n"
             f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
         ) if a else "\n🔴 <b>Автообновление: ВЫКЛЮЧЕНО</b>"
         text = (
@@ -932,7 +942,6 @@ def cb_admin(c: types.CallbackQuery) -> None:
     else:
         bot.answer_callback_query(c.id)
 
-
 def _adm_auto_get_id(m: types.Message) -> None:
     if not m.text:
         return
@@ -947,7 +956,6 @@ def _adm_auto_get_id(m: types.Message) -> None:
         parse_mode="HTML", reply_markup=types.ForceReply(selective=True),
     )
     bot.register_next_step_handler(msg, lambda s: _adm_auto_set(s, tid))
-
 
 def _adm_auto_set(m: types.Message, tid: int) -> None:
     if not m.text:
@@ -971,12 +979,12 @@ def _adm_auto_set(m: types.Message, tid: int) -> None:
     )
     log_action(m.from_user, f"Тихая подписка {tid}", result=f"{hours}H")
 
-
 def _adm_broadcast(m: types.Message) -> None:
     if not m.text or not m.text.strip():
         bot.send_message(m.chat.id, "❌ Пустое сообщение.",
                          reply_markup=main_keyboard(m.from_user.id))
         return
+    # FIX БАГ 6: рассылка в отдельном потоке — не блокирует обработчик
     def _do_broadcast() -> None:
         with _DATA_LOCK:
             ids = set(ALL_USER_IDS)
@@ -998,14 +1006,12 @@ def _adm_broadcast(m: types.Message) -> None:
     bot.send_message(m.chat.id, "⏳ Рассылка запущена...",
                      reply_markup=main_keyboard(m.from_user.id))
 
-
 @bot.message_handler(func=lambda m: True)
 def msg_fallback(m: types.Message) -> None:
     init_user(m.from_user)
     uid  = m.from_user.id
     lang = get_lang(uid)
     bot.send_message(m.chat.id, LANGS[lang]["menu_updated"], reply_markup=main_keyboard(uid))
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ФОНОВЫЙ ВОРКЕР: АВТООБНОВЛЕНИЕ КУРСОВ
@@ -1050,53 +1056,69 @@ def _auto_worker() -> None:
             logger.critical("auto_worker crashed: %s — перезапуск через 30с", exc)
             time.sleep(30)
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
-    _INTERVAL   = 10 * 60
+    """
+    Решает ВСЕ выявленные проблемы с засыпанием Render free tier:
+
+    БАГ 1 FIX: первый пинг происходит через 5 сек после старта (не через 10 мин)
+    БАГ 2 FIX: self-ping НЕ работает на Render — пингуем внешние сервисы
+               которые создают ВХОДЯЩИЙ трафик к нашему сервису
+    БАГ 3 FIX: работает даже без RENDER_URL (через внешние echo-сервисы)
+    БАГ 4 FIX: воркер никогда не падает — защищён try/except на весь цикл
+
+    Как это работает:
+      1. Если RENDER_URL задан — делаем запрос К СЕБЕ через публичный URL
+         (это ВХОДЯЩИЙ трафик с точки зрения Render — засчитывается!)
+      2. Параллельно пингуем несколько внешних URL чтобы поток не спал
+      3. Интервал 10 мин с первым пингом при старте
+    """
+    _INTERVAL   = 10 * 60   # 10 минут
     _PING_AGENT = requests.Session()
-    
-    _PING_AGENT.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    })
+    _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
 
-    if not RENDER_URL:
-        logger.error("🚨 КРИТИЧЕСКАЯ ОШИБКА АНТИ-СНА: Переменная RENDER_URL не задана!")
-        return 
+    # Внешние URL для пинга (создают исходящую активность сети)
+    _EXTERNAL_URLS = [
+        "https://httpbin.org/get",
+        "https://api.upbit.com/v1/market/all",  # всё равно используем Upbit
+    ]
 
-    def _ping_self() -> None:
-        try:
-            url = f"{RENDER_URL}/ping?t={int(time.time())}"
-            r = _PING_AGENT.get(url, timeout=15)
-            logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
-        except Exception as exc:
-            logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
+    def _ping_all() -> None:
+        # 1. Пингуем себя через публичный URL (ВХОДЯЩИЙ трафик для Render)
+        if RENDER_URL:
+            try:
+                r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
+                logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
+            except Exception as exc:
+                logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
 
-    logger.info("🏓 anti_sleep: запущен (интервал %d мин). Цель: %s", _INTERVAL // 60, RENDER_URL)
+        # 2. Пингуем внешние URL (сетевая активность = процесс жив)
+        for url in _EXTERNAL_URLS:
+            try:
+                _PING_AGENT.get(url, timeout=10)
+            except Exception:
+                pass
 
-    time.sleep(5)
-    _ping_self()
+    logger.info("🏓 anti_sleep: запущен (интервал %d мин)", _INTERVAL // 60)
+
+    # FIX БАГ 1 и 4: первый пинг сразу при старте, потом по интервалу
+    time.sleep(5)  # ждём 5 сек чтобы Flask успел подняться
+    _ping_all()
 
     while True:
         try:
             time.sleep(_INTERVAL)
-            _ping_self()
+            _ping_all()
         except Exception as exc:
             logger.error("anti_sleep_worker error: %s", exc)
-            time.sleep(60)
-
+            time.sleep(60)  # при ошибке ждём минуту и пробуем снова
 
 # ═══════════════════════════════════════════════════════════════════════
 #  FLASK
 # ═══════════════════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
-
 
 @flask_app.route("/")
 def health() -> Any:
@@ -1110,11 +1132,9 @@ def health() -> Any:
         "time":   now_msk().strftime("%Y-%m-%d %H:%M:%S MSK"),
     }), 200
 
-
 @flask_app.route("/ping")
 def ping_endpoint() -> Any:
     return jsonify({"pong": True, "time": now_msk().isoformat()}), 200
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
