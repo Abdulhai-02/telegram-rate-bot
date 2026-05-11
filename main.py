@@ -422,85 +422,44 @@ def _fetch_bithumb() -> Optional[float]:
 
 def _fetch_krw_rub() -> Optional[float]:
     """
-    Курс 1 000 000 KRW → RUB.
-    Источники (в порядке приоритета):
-      1. Yahoo Finance (KRWRUB=X) — реальное время, без API-ключа
-      2. Google Finance (парсинг HTML) — резервный
-      3. open.er-api.com — запасной, если первые два недоступны
+    1 000 000 KRW → RUB.
+
+    Логика взята из оригинального g_r() — requests.get() напрямую
+    (не через сессию) чтобы каждый раз получать свежий ответ.
+    Формула: 1_000_000 / rates["KRW"] — точно как в оригинале.
+    Три URL с fallback для надёжности.
     """
-    import re as _re
-
-    # ── 1. Yahoo Finance ───────────────────────────────────────────
-    for yf_url in (
-        "https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X",
-        "https://query2.finance.yahoo.com/v8/finance/chart/KRWRUB=X",
-    ):
+    # Заголовки no-cache — сервер не вернёт кэшированный ответ
+    _headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    }
+    # Три endpoint — первый рабочий используется
+    _urls = [
+        "https://open.er-api.com/v6/latest/RUB",
+        "https://open.er-api.com/v6/latest/KRW",
+        "https://v6.exchangerate-api.com/v6/latest/RUB",
+    ]
+    for url in _urls:
         try:
-            r = _get_session().get(
-                yf_url,
-                headers={"Accept": "application/json"},
-                timeout=_API_TIMEOUT,
-            )
+            # requests.get() напрямую как в оригинале — свежее соединение
+            r = requests.get(url, headers=_headers, timeout=7)
             r.raise_for_status()
-            price = (
-                r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-            )
-            if price and float(price) > 0:
-                result = float(price) * 1_000_000
-                logger.info("Yahoo Finance KRW/RUB: 1M KRW = %.2f RUB", result)
-                return result
-        except Exception:
+            data = r.json()
+            rates = data.get("rates", {})
+            if "KRW" in url:
+                # /latest/KRW → rates["RUB"] = сколько RUB за 1 KRW
+                rub = rates.get("RUB")
+                if rub and float(rub) > 0:
+                    return float(rub) * 1_000_000
+            else:
+                # /latest/RUB → rates["KRW"] = сколько KRW за 1 RUB
+                krw = rates.get("KRW")
+                if krw and float(krw) > 0:
+                    return 1_000_000 / float(krw)
+        except Exception as exc:
+            logger.warning("_fetch_krw_rub [%s]: %s", url, exc)
             continue
-
-    # ── 2. Google Finance (парсинг) ────────────────────────────────
-    try:
-        r = _get_session().get(
-            "https://www.google.com/finance/quote/KRW-RUB",
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml",
-                "Cache-Control": "no-cache",
-            },
-            timeout=_API_TIMEOUT,
-        )
-        r.raise_for_status()
-        html = r.text
-        for pattern in (
-            r'data-last-price="([\d.]+)"',
-            r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
-            r'jsname="ip75Cb"[^>]*>([\d.]+)<',
-        ):
-            m = _re.search(pattern, html)
-            if m:
-                price = float(m.group(1))
-                if price > 0:
-                    result = price * 1_000_000
-                    logger.info("Google Finance KRW/RUB: 1M KRW = %.2f RUB", result)
-                    return result
-    except Exception:
-        pass
-
-    # ── 3. open.er-api.com (запасной) ─────────────────────────────
-    try:
-        r = _get_session().get(
-            "https://open.er-api.com/v6/latest/RUB",
-            timeout=_API_TIMEOUT,
-        )
-        r.raise_for_status()
-        krw = r.json()["rates"].get("KRW")
-        if krw and float(krw) > 0:
-            result = 1_000_000 / float(krw)
-            logger.info("open.er-api KRW/RUB: 1M KRW = %.2f RUB", result)
-            return result
-    except Exception:
-        pass
-
-    logger.warning("_fetch_krw_rub: все источники недоступны")
     return None
 
 
