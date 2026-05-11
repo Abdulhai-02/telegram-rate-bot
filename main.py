@@ -367,12 +367,16 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
-
 def _get_session() -> requests.Session:
-    """Thread-local сессия — потокобезопасный HTTP."""
+    """Thread-local сессия — потокобезопасный HTTP без кэширования."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        s.headers.update({"User-Agent": "Mozilla/5.0 (P2PBot/4.0)"})
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        })
         _thread_local.session = s
     return _thread_local.session
 
@@ -380,7 +384,7 @@ def _get_session() -> requests.Session:
 def _fetch_upbit() -> Optional[float]:
     try:
         r = _get_session().get(
-            "https://api.upbit.com/v1/ticker?markets=KRW-USDT",
+            f"https://api.upbit.com/v1/ticker?markets=KRW-USDT&_t={int(time.time() * 1000)}",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -394,7 +398,7 @@ def _fetch_bithumb() -> Optional[float]:
     # Вариант 1: новый v1 endpoint
     try:
         r = _get_session().get(
-            "https://api.bithumb.com/v1/ticker?markets=KRW-USDT",
+            f"https://api.bithumb.com/v1/ticker?markets=KRW-USDT&_t={int(time.time() * 1000)}",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -408,7 +412,7 @@ def _fetch_bithumb() -> Optional[float]:
     # Вариант 2: старый public endpoint (fallback)
     try:
         r = _get_session().get(
-            "https://api.bithumb.com/public/ticker/USDT_KRW",
+            f"https://api.bithumb.com/public/ticker/USDT_KRW?_t={int(time.time() * 1000)}",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -422,74 +426,60 @@ def _fetch_bithumb() -> Optional[float]:
 
 def _fetch_krw_rub() -> Optional[float]:
     """
-    Парсит курс KRW/RUB с Google Finance (с пробитием кэша).
-    Если Google недоступен — использует резервные банковские API.
+    Парсит курс KRW/RUB напрямую с Google Finance с жестким антикэшем.
+    Резервный вариант — мгновенный JSON API от Yahoo Finance.
     """
     import re
-    
-    # Пробиваем кэш уникальной меткой времени (timestamp)
     t_stamp = int(time.time() * 1000)
-    google_url = f"https://www.google.com/finance/quote/KRW-RUB?_t={t_stamp}"
     
-    # Жёсткие антикэш-заголовки + маскировка под Chrome Windows
-    google_headers = {
+    # Ссылка на Google Finance
+    google_url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={t_stamp}"
+    
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0"
     }
-    
-    _PATTERNS = [
-        r'data-last-price="([\d.]+)"',
-        r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
-        r'jsname="ip75Cb"[^>]*>([\d.]+)<',
-    ]
-    
+
+    # 1. Основной парсинг Google Finance
     try:
-        # Изолированный запрос вне общей сессии, чтобы не спалиться
-        r = requests.get(google_url, headers=google_headers, timeout=_API_TIMEOUT)
-        r.raise_for_status()
-        html = r.text
-        
-        for pattern in _PATTERNS:
-            m = re.search(pattern, html)
-            if m:
-                price = float(m.group(1))
-                if price > 0:
-                    result = 1_000_000 * price
-                    logger.info("Google Finance KRW/RUB [Fresh]: 1M KRW = %.2f RUB", result)
-                    return result
-                    
-        logger.warning("Google Finance: паттерн цены не найден в HTML")
+        r = requests.get(google_url, headers=headers, timeout=_API_TIMEOUT)
+        if r.status_code == 200:
+            html = r.text
+            patterns = [
+                r'data-last-price="([\d.]+)"',
+                r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
+                r'jsname="ip75Cb"[^>]*>([\d.]+)<'
+            ]
+            for p in patterns:
+                m = re.search(p, html)
+                if m:
+                    price = float(m.group(1))
+                    if price > 0:
+                        return 1_000_000 * price
     except Exception as exc:
         logger.warning("Google Finance KRW/RUB error: %s", exc)
-        
-    # Резервные API, если Google выдал капчу/ошибку (тоже с антикэшем)
-    fallback_urls = [
-        f"https://open.er-api.com/v6/latest/RUB?_t={t_stamp}",
-        f"https://v6.exchangerate-api.com/v6/latest/RUB?_t={t_stamp}"
-    ]
-    
-    for url in fallback_urls:
-        try:
-            r = _get_session().get(url, timeout=_API_TIMEOUT)
-            r.raise_for_status()
-            krw = r.json()["rates"].get("KRW")
-            if krw and float(krw) > 0:
-                return 1_000_000 / float(krw)
-        except Exception:
-            continue
-            
-    logger.warning("ExchangeRate: оба резервных источника недоступны")
+
+    # 2. Мгновенный резерв через Yahoo Finance (JSON API, не кэшируется)
+    try:
+        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?_t={t_stamp}"
+        r = requests.get(yahoo_url, headers=headers, timeout=_API_TIMEOUT)
+        if r.status_code == 200:
+            price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            if price > 0:
+                return 1_000_000 * float(price)
+    except Exception as exc:
+        logger.warning("Yahoo Finance KRW/RUB error: %s", exc)
+
     return None
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
     try:
         r = _get_session().get(
-            "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
-            "?instrumentCode=USDTRUB",
+            f"https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB&_t={int(time.time() * 1000)}",
             timeout=_API_TIMEOUT,
         )
         r.raise_for_status()
@@ -551,11 +541,11 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"  ◾ BITHUMB:  <b>{fmt_num(rates['bithumb'], 0)} ₩</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇷🇺 <b>USDT → RUB  (ABCEX)</b>\n"
-        f"  ◾ {T['buy']}:   <b>{fmt_num(rates['ab_buy'],  2)} ₽</b>\n"
-        f"  ◾ {T['sell']}:  <b>{fmt_num(rates['ab_sell'], 2)} ₽</b>\n"
+        f"  ◾ {T['buy']}:   <b>{fmt_num(rates['ab_buy'],  0)} ₽</b>\n"
+        f"  ◾ {T['sell']}:  <b>{fmt_num(rates['ab_sell'], 0)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-        f"  ◾ 1 000 000 ₩ → <b>{fmt_num(rates['krw_rub'], 2)} ₽</b>\n"
+        f"  ◾ 1 000 000 ₩ → <b>{fmt_num(rates['krw_rub'], 0)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{T['updated']} <b>{ts}</b>\n\n"
         f"{T['contact']}"
@@ -565,7 +555,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
 def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     """
     Компактное авто-сообщение.
-    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+    Формат: 🔔 AUTO: 1 474 ₩ | 77 ₽ | 50 459 ₽
     """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
@@ -581,8 +571,8 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     krw_rub = rates.get("krw_rub")
 
     part_krw     = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
-    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"  if usdt_rub is not None else "— ₽"
-    part_krw_rub = f"{int(round(krw_rub)):,} ₽"  if krw_rub  is not None else "— ₽"
+    part_rub     = f"{fmt_num(usdt_rub, 0)} ₽"  if usdt_rub is not None else "— ₽"
+    part_krw_rub = f"{int(round(krw_rub)):,} ₽".replace(",", " ")  if krw_rub  is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
 
@@ -671,7 +661,7 @@ def msg_show_rate(m: types.Message) -> None:
         USER_DATA[uid]["last"]      = now_msk()
     save_user(uid)
     log_action(m.from_user, "Показать курс",
-               result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],2)} ₽")
+               result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],0)} ₽")
 
 
 @bot.message_handler(func=lambda m: m.text in (
