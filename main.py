@@ -360,16 +360,15 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  API — ПОЛУЧЕНИЕ КУРСОВ 
+#  API — ПОЛУЧЕНИЕ КУРСОВ
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
 def _get_session() -> requests.Session:
-    """Thread-local сессия — потокобезопасный HTTP без кэширования."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0"
@@ -415,65 +414,36 @@ def _fetch_bithumb() -> Optional[float]:
         if price:
             return float(price)
     except Exception as exc:
-        logger.warning("Bithumb: %s", exc)
+        logger.warning("Bithumb (оба варианта): %s", exc)
     return None
 
 
 def _fetch_krw_rub() -> Optional[float]:
-    """ГЛУБОКИЙ ПАРСИНГ GOOGLE FINANCE С 3-МЯ УРОВНЯМИ ЗАЩИТЫ ОТ СБОЕВ"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     
-    # Специфичные заголовки для Google, чтобы он думал, что мы из Chrome браузера
-    google_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-    }
-
+    # 1. Прямой парсинг Google Finance (самый точный "курс гугла")
     try:
-        # 1. Запрашиваем Google Finance
         url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={int(time.time() * 1000)}"
-        r = _get_session().get(url, headers=google_headers, timeout=_API_TIMEOUT)
+        r = requests.get(url, headers=headers, timeout=5)
         r.raise_for_status()
-
-        # 2. Ищем курс по нескольким паттернам (Google постоянно меняет верстку!)
-        
-        # Паттерн А: Современный класс Google Finance
-        match_a = re.search(r'class="YMlKec fxKbKc">([0-9.,]+)</div>', r.text)
-        # Паттерн B: Старый атрибут data-last-price (на всякий случай)
-        match_b = re.search(r'data-last-price="([0-9.]+)"', r.text)
-        # Паттерн C: Скрытый мета-тег для поисковиков
-        match_c = re.search(r'<meta itemprop="price" content="([0-9.]+)"', r.text)
-
-        raw_price = None
-        if match_a:
-            raw_price = match_a.group(1).replace(',', '.') # Убираем запятые, если Google выдал русскую локаль
-        elif match_b:
-            raw_price = match_b.group(1)
-        elif match_c:
-            raw_price = match_c.group(1)
-
-        # 3. Применяем курс, если он найден
-        if raw_price:
-            price = float(raw_price)
+        match = re.search(r'data-last-price="([0-9.]+)"', r.text)
+        if match:
+            price = float(match.group(1))
             if price > 0:
                 return price * 1_000_000
-    except Exception as exc:
-        logger.warning("Google Finance не спарсился: %s", exc)
+    except Exception as exc: 
+        logger.warning("Google: %s", exc)
 
-    # === РЕЗЕРВНЫЙ ВАРИАНТ, ЕСЛИ GOOGLE ВООБЩЕ ЛЕЖИТ ИЛИ ЗАБЛОКИРОВАЛ IP ===
+    # 2. Мощный фоллбэк на Yahoo Finance
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?interval=1m&range=1d&_t={int(time.time() * 1000)}"
-        r = _get_session().get(url, timeout=_API_TIMEOUT)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?region=US&lang=en-US&includePrePost=false&interval=1m&useYfid=true&range=1d&_t={int(time.time() * 1000)}"
+        r = requests.get(url, headers=headers, timeout=5)
         r.raise_for_status()
         price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
         if price and float(price) > 0:
             return float(price) * 1_000_000
-    except Exception as exc:
-        logger.warning("Yahoo Finance также недоступен: %s", exc)
+    except Exception as exc: 
+        logger.warning("Yahoo: %s", exc)
 
     return None
 
@@ -607,7 +577,6 @@ def cb_lang(c: types.CallbackQuery) -> None:
     log_action(c.from_user, "Язык", result="🇷🇺 RU" if lang == "ru" else "🇬🇧 EN")
 
 
-# ─── Показать курс ──────────────────────────────────────────────────
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_show"], LANGS["en"]["btn_show"]
 ))
@@ -716,9 +685,6 @@ def _feedback_receive(m: types.Message) -> None:
     bot.send_message(m.chat.id, T["feedback_ok"], reply_markup=main_keyboard(uid))
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  АВТООБНОВЛЕНИЕ — ПОЛЬЗОВАТЕЛЬ
-# ═══════════════════════════════════════════════════════════════════════
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_auto"], LANGS["en"]["btn_auto"]
 ))
@@ -789,9 +755,6 @@ def msg_disable_auto(m: types.Message) -> None:
     log_action(m.from_user, "Отключил уведомления")
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  АДМИН-ПАНЕЛЬ
-# ═══════════════════════════════════════════════════════════════════════
 @bot.message_handler(func=lambda m: (
     m.from_user.id == MY_ADMIN_ID
     and m.text in (LANGS["ru"]["btn_admin"], LANGS["en"]["btn_admin"])
