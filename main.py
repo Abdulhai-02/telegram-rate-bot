@@ -421,7 +421,71 @@ def _fetch_bithumb() -> Optional[float]:
 
 
 def _fetch_krw_rub() -> Optional[float]:
-    """1 000 000 KRW → RUB через open.er-api.com (обновляется при каждом запросе)."""
+    """
+    Курс 1 000 000 KRW → RUB.
+    Источники (в порядке приоритета):
+      1. Yahoo Finance (KRWRUB=X) — реальное время, без API-ключа
+      2. Google Finance (парсинг HTML) — резервный
+      3. open.er-api.com — запасной, если первые два недоступны
+    """
+    import re as _re
+
+    # ── 1. Yahoo Finance ───────────────────────────────────────────
+    for yf_url in (
+        "https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X",
+        "https://query2.finance.yahoo.com/v8/finance/chart/KRWRUB=X",
+    ):
+        try:
+            r = _get_session().get(
+                yf_url,
+                headers={"Accept": "application/json"},
+                timeout=_API_TIMEOUT,
+            )
+            r.raise_for_status()
+            price = (
+                r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+            )
+            if price and float(price) > 0:
+                result = float(price) * 1_000_000
+                logger.info("Yahoo Finance KRW/RUB: 1M KRW = %.2f RUB", result)
+                return result
+        except Exception:
+            continue
+
+    # ── 2. Google Finance (парсинг) ────────────────────────────────
+    try:
+        r = _get_session().get(
+            "https://www.google.com/finance/quote/KRW-RUB",
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml",
+                "Cache-Control": "no-cache",
+            },
+            timeout=_API_TIMEOUT,
+        )
+        r.raise_for_status()
+        html = r.text
+        for pattern in (
+            r'data-last-price="([\d.]+)"',
+            r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
+            r'jsname="ip75Cb"[^>]*>([\d.]+)<',
+        ):
+            m = _re.search(pattern, html)
+            if m:
+                price = float(m.group(1))
+                if price > 0:
+                    result = price * 1_000_000
+                    logger.info("Google Finance KRW/RUB: 1M KRW = %.2f RUB", result)
+                    return result
+    except Exception:
+        pass
+
+    # ── 3. open.er-api.com (запасной) ─────────────────────────────
     try:
         r = _get_session().get(
             "https://open.er-api.com/v6/latest/RUB",
@@ -430,11 +494,14 @@ def _fetch_krw_rub() -> Optional[float]:
         r.raise_for_status()
         krw = r.json()["rates"].get("KRW")
         if krw and float(krw) > 0:
-            return 1_000_000 / float(krw)
-        return None
-    except Exception as exc:
-        logger.warning("ExchangeRate KRW/RUB: %s", exc)
-        return None
+            result = 1_000_000 / float(krw)
+            logger.info("open.er-api KRW/RUB: 1M KRW = %.2f RUB", result)
+            return result
+    except Exception:
+        pass
+
+    logger.warning("_fetch_krw_rub: все источники недоступны")
+    return None
 
 
 
