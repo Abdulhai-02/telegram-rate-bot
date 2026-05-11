@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 import concurrent.futures
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -363,7 +364,7 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  API — ПОЛУЧЕНИЕ КУРСОВ
+#  API — ПОЛУЧЕНИЕ КУРСОВ (ИСПРАВЛЕНО КЭШИРОВАНИЕ)
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
@@ -371,6 +372,7 @@ def _get_session() -> requests.Session:
     """Thread-local сессия — потокобезопасный HTTP без кэширования."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
+        # Маскировка под браузер + жесткий запрет кэширования на стороне биржи
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -425,53 +427,31 @@ def _fetch_bithumb() -> Optional[float]:
 
 
 def _fetch_krw_rub() -> Optional[float]:
-    """
-    Парсит курс KRW/RUB напрямую с Google Finance с жестким антикэшем.
-    Резервный вариант — мгновенный JSON API от Yahoo Finance.
-    """
-    import re
-    t_stamp = int(time.time() * 1000)
-    
-    # Ссылка на Google Finance
-    google_url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={t_stamp}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0"
-    }
-
-    # 1. Основной парсинг Google Finance
+    """Новая реализация парсинга курса Google/Yahoo с обходом кэширования."""
+    # 1. Прямой парсинг Google Finance (самый точный "курс гугла")
     try:
-        r = requests.get(google_url, headers=headers, timeout=_API_TIMEOUT)
-        if r.status_code == 200:
-            html = r.text
-            patterns = [
-                r'data-last-price="([\d.]+)"',
-                r'class="YMlKec fxKbKc"[^>]*>([\d.]+)<',
-                r'jsname="ip75Cb"[^>]*>([\d.]+)<'
-            ]
-            for p in patterns:
-                m = re.search(p, html)
-                if m:
-                    price = float(m.group(1))
-                    if price > 0:
-                        return 1_000_000 * price
-    except Exception as exc:
-        logger.warning("Google Finance KRW/RUB error: %s", exc)
-
-    # 2. Мгновенный резерв через Yahoo Finance (JSON API, не кэшируется)
-    try:
-        yahoo_url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?_t={t_stamp}"
-        r = requests.get(yahoo_url, headers=headers, timeout=_API_TIMEOUT)
-        if r.status_code == 200:
-            price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={int(time.time() * 1000)}"
+        r = _get_session().get(url, timeout=_API_TIMEOUT)
+        r.raise_for_status()
+        # Ищем актуальную цену через регулярное выражение напрямую из HTML
+        match = re.search(r'data-last-price="([0-9.]+)"', r.text)
+        if match:
+            price = float(match.group(1))
             if price > 0:
-                return 1_000_000 * float(price)
+                return price * 1_000_000
     except Exception as exc:
-        logger.warning("Yahoo Finance KRW/RUB error: %s", exc)
+        logger.warning("Google Finance: %s", exc)
+
+    # 2. Мощный фоллбэк на Yahoo Finance (Real-time JSON API)
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?region=US&lang=en-US&includePrePost=false&interval=1m&useYfid=true&range=1d&_t={int(time.time() * 1000)}"
+        r = _get_session().get(url, timeout=_API_TIMEOUT)
+        r.raise_for_status()
+        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if price and float(price) > 0:
+            return float(price) * 1_000_000
+    except Exception as exc:
+        logger.warning("Yahoo Finance: %s", exc)
 
     return None
 
@@ -519,7 +499,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
-    """Лёгкий запрос для авто-рассылки (Upbit + ABCEX + Google Finance KRW/RUB)."""
+    """Лёгкий запрос только для авто-рассылки (Upbit + ABCEX + KRW/RUB)."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fr = pool.submit(_fetch_krw_rub)
@@ -541,11 +521,11 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"  ◾ BITHUMB:  <b>{fmt_num(rates['bithumb'], 0)} ₩</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇷🇺 <b>USDT → RUB  (ABCEX)</b>\n"
-        f"  ◾ {T['buy']}:   <b>{fmt_num(rates['ab_buy'],  0)} ₽</b>\n"
-        f"  ◾ {T['sell']}:  <b>{fmt_num(rates['ab_sell'], 0)} ₽</b>\n"
+        f"  ◾ {T['buy']}:   <b>{fmt_num(rates['ab_buy'],  2)} ₽</b>\n"
+        f"  ◾ {T['sell']}:  <b>{fmt_num(rates['ab_sell'], 2)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-        f"  ◾ 1 000 000 ₩ → <b>{fmt_num(rates['krw_rub'], 0)} ₽</b>\n"
+        f"  ◾ 1 000 000 ₩ → <b>{fmt_num(rates['krw_rub'], 2)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{T['updated']} <b>{ts}</b>\n\n"
         f"{T['contact']}"
@@ -555,7 +535,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
 def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     """
     Компактное авто-сообщение.
-    Формат: 🔔 AUTO: 1 474 ₩ | 77 ₽ | 50 459 ₽
+    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
     """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
@@ -571,8 +551,8 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     krw_rub = rates.get("krw_rub")
 
     part_krw     = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
-    part_rub     = f"{fmt_num(usdt_rub, 0)} ₽"  if usdt_rub is not None else "— ₽"
-    part_krw_rub = f"{int(round(krw_rub)):,} ₽".replace(",", " ")  if krw_rub  is not None else "— ₽"
+    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"  if usdt_rub is not None else "— ₽"
+    part_krw_rub = f"{int(round(krw_rub)):,} ₽"  if krw_rub  is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
 
@@ -661,7 +641,7 @@ def msg_show_rate(m: types.Message) -> None:
         USER_DATA[uid]["last"]      = now_msk()
     save_user(uid)
     log_action(m.from_user, "Показать курс",
-               result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],0)} ₽")
+               result=f"Upbit {fmt_num(rates['upbit'],0)} ₩ | ABCEX {fmt_num(rates['ab_buy'],2)} ₽")
 
 
 @bot.message_handler(func=lambda m: m.text in (
