@@ -420,45 +420,23 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
-def _fetch_krw_rub() -> Optional[float]:
+def _fetch_krw_rub_google() -> Optional[float]:
     """
-    1 000 000 KRW → RUB.
-
-    Логика взята из оригинального g_r() — requests.get() напрямую
-    (не через сессию) чтобы каждый раз получать свежий ответ.
-    Формула: 1_000_000 / rates["KRW"] — точно как в оригинале.
-    Три URL с fallback для надёжности.
+    Справочный курс KRW→RUB с open.er-api.com (обновляется раз в сутки).
+    Показывается в скобках рядом с основным курсом.
+    Используем requests.get() напрямую как в оригинале — без сессии.
     """
-    # Заголовки no-cache — сервер не вернёт кэшированный ответ
-    _headers = {
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-    }
-    # Три endpoint — первый рабочий используется
-    _urls = [
+    for url in (
         "https://open.er-api.com/v6/latest/RUB",
-        "https://open.er-api.com/v6/latest/KRW",
         "https://v6.exchangerate-api.com/v6/latest/RUB",
-    ]
-    for url in _urls:
+    ):
         try:
-            # requests.get() напрямую как в оригинале — свежее соединение
-            r = requests.get(url, headers=_headers, timeout=7)
+            r = requests.get(url, timeout=7)
             r.raise_for_status()
-            data = r.json()
-            rates = data.get("rates", {})
-            if "KRW" in url:
-                # /latest/KRW → rates["RUB"] = сколько RUB за 1 KRW
-                rub = rates.get("RUB")
-                if rub and float(rub) > 0:
-                    return float(rub) * 1_000_000
-            else:
-                # /latest/RUB → rates["KRW"] = сколько KRW за 1 RUB
-                krw = rates.get("KRW")
-                if krw and float(krw) > 0:
-                    return 1_000_000 / float(krw)
-        except Exception as exc:
-            logger.warning("_fetch_krw_rub [%s]: %s", url, exc)
+            krw = r.json()["rates"].get("KRW")
+            if krw and float(krw) > 0:
+                return 1_000_000 / float(krw)
+        except Exception:
             continue
     return None
 
@@ -497,44 +475,88 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        fr = pool.submit(_fetch_krw_rub)
+        fg = pool.submit(_fetch_krw_rub_google)
         fa = pool.submit(_fetch_abcex)
-        upbit   = _safe_future(fu)
-        bithumb = _safe_future(fb)
-        krw_rub = _safe_future(fr)
-        abcex   = _safe_future(fa, default=(None, None))
+        upbit       = _safe_future(fu)
+        bithumb     = _safe_future(fb)
+        krw_google  = _safe_future(fg)   # справочный курс (скобки)
+        abcex       = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    return {"upbit": upbit, "bithumb": bithumb, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
+    # Основной курс KRW→RUB: кросс через USDT + 0.55% наценка
+    usdt_rub_mid = None
+    if ab_buy is not None and ab_sell is not None:
+        usdt_rub_mid = (ab_buy + ab_sell) / 2
+    elif ab_buy is not None:
+        usdt_rub_mid = ab_buy
+    elif ab_sell is not None:
+        usdt_rub_mid = ab_sell
+    if upbit and upbit > 0 and usdt_rub_mid:
+        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.0055
+    else:
+        krw_rub = None
+    return {
+        "upbit":      upbit,
+        "bithumb":    bithumb,
+        "krw_rub":    krw_rub,      # кросс USDT + 0.55% (основной)
+        "krw_google": krw_google,   # open.er-api (справочный, в скобках)
+        "ab_buy":     ab_buy,
+        "ab_sell":    ab_sell,
+    }
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
-    """Лёгкий запрос для авто-рассылки (Upbit + ABCEX + Google Finance KRW/RUB)."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    """Лёгкий запрос для авто-рассылки (Upbit + ABCEX, KRW/RUB кросс через USDT)."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         fu = pool.submit(_fetch_upbit)
-        fr = pool.submit(_fetch_krw_rub)
         fa = pool.submit(_fetch_abcex)
-        upbit   = _safe_future(fu)
-        krw_rub = _safe_future(fr)
-        abcex   = _safe_future(fa, default=(None, None))
+        upbit = _safe_future(fu)
+        abcex = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
+    usdt_rub_mid = None
+    if ab_buy is not None and ab_sell is not None:
+        usdt_rub_mid = (ab_buy + ab_sell) / 2
+    elif ab_buy is not None:
+        usdt_rub_mid = ab_buy
+    elif ab_sell is not None:
+        usdt_rub_mid = ab_sell
+    if upbit and upbit > 0 and usdt_rub_mid:
+        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.0055
+    else:
+        krw_rub = None
     return {"upbit": upbit, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
 
 
 def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     T  = LANGS[lang]
     ts = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
+
+    # ABCEX покупка +0.55% наценка
+    ab_buy_raw  = rates.get("ab_buy")
+    ab_buy_show = (ab_buy_raw * 1.0055) if ab_buy_raw is not None else None
+
+    # KRW→RUB: основной (кросс+0.55%) и справочный гугл в скобках
+    krw_main   = rates.get("krw_rub")    # кросс через USDT + 0.55%
+    krw_google = rates.get("krw_google") # open.er-api (справочный)
+
+    if krw_main is not None and krw_google is not None:
+        krw_line = f"<b>{fmt_num(krw_main, 2)} ₽</b>  ({fmt_num(krw_google, 2)} ₽)"
+    elif krw_main is not None:
+        krw_line = f"<b>{fmt_num(krw_main, 2)} ₽</b>"
+    else:
+        krw_line = "—"
+
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
-        f"  ◾ UPBIT:    <b>{fmt_num(rates['upbit'],   0)} ₩</b>\n"
-        f"  ◾ BITHUMB:  <b>{fmt_num(rates['bithumb'], 0)} ₩</b>\n"
+        f"  ◾ UPBIT:    <b>{fmt_num(rates.get('upbit'),   0)} ₩</b>\n"
+        f"  ◾ BITHUMB:  <b>{fmt_num(rates.get('bithumb'), 0)} ₩</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇷🇺 <b>USDT → RUB  (ABCEX)</b>\n"
-        f"  ◾ {T['buy']}:   <b>{fmt_num(rates['ab_buy'],  2)} ₽</b>\n"
-        f"  ◾ {T['sell']}:  <b>{fmt_num(rates['ab_sell'], 2)} ₽</b>\n"
+        f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_show, 2)} ₽</b>\n"
+        f"  🔴 {T['sell']}:  <b>{fmt_num(rates.get('ab_sell'), 2)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-        f"  ◾ 1 000 000 ₩ → <b>{fmt_num(rates['krw_rub'], 2)} ₽</b>\n"
+        f"  ◾ 1 000 000 ₩ → {krw_line}\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{T['updated']} <b>{ts}</b>\n\n"
         f"{T['contact']}"
