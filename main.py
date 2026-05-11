@@ -364,7 +364,7 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  API — ПОЛУЧЕНИЕ КУРСОВ (ИСПРАВЛЕНО КЭШИРОВАНИЕ)
+#  API — ПОЛУЧЕНИЕ КУРСОВ
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
@@ -427,13 +427,10 @@ def _fetch_bithumb() -> Optional[float]:
 
 
 def _fetch_krw_rub() -> Optional[float]:
-    """Новая реализация парсинга курса Google/Yahoo с обходом кэширования."""
-    # 1. Прямой парсинг Google Finance (самый точный "курс гугла")
     try:
         url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={int(time.time() * 1000)}"
         r = _get_session().get(url, timeout=_API_TIMEOUT)
         r.raise_for_status()
-        # Ищем актуальную цену через регулярное выражение напрямую из HTML
         match = re.search(r'data-last-price="([0-9.]+)"', r.text)
         if match:
             price = float(match.group(1))
@@ -442,7 +439,6 @@ def _fetch_krw_rub() -> Optional[float]:
     except Exception as exc:
         logger.warning("Google Finance: %s", exc)
 
-    # 2. Мощный фоллбэк на Yahoo Finance (Real-time JSON API)
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?region=US&lang=en-US&includePrePost=false&interval=1m&useYfid=true&range=1d&_t={int(time.time() * 1000)}"
         r = _get_session().get(url, timeout=_API_TIMEOUT)
