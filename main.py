@@ -42,12 +42,10 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
-# RENDER_URL — адрес вашего сервиса, например: https://my-bot.onrender.com
-# Задаётся в Environment Variables на Render
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
-_API_TIMEOUT  = 8    # сек на один HTTP-запрос к бирже
-_API_MAX_WAIT = 12   # сек — жёсткий потолок ожидания всех futures
+_API_TIMEOUT  = 8
+_API_MAX_WAIT = 12
 
 _DATA_LOCK = threading.Lock()
 
@@ -182,7 +180,6 @@ def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
 
 
 def _elapsed_sec(dt: Optional[datetime]) -> float:
-    """Секунд прошло с dt. Корректно для naive и aware datetime."""
     if dt is None:
         return float("inf")
     try:
@@ -196,7 +193,6 @@ def _elapsed_sec(dt: Optional[datetime]) -> float:
 #  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════════
 def load_db() -> None:
-    """Загружает все профили и подписки из MongoDB в RAM при старте."""
     if users_col is None or auto_col is None:
         logger.warning("load_db: MongoDB недоступна, пропускаем")
         return
@@ -364,7 +360,7 @@ def main_keyboard(uid: int) -> types.ReplyKeyboardMarkup:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  API — ПОЛУЧЕНИЕ КУРСОВ
+#  API — ПОЛУЧЕНИЕ КУРСОВ 
 # ═══════════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
@@ -372,9 +368,8 @@ def _get_session() -> requests.Session:
     """Thread-local сессия — потокобезопасный HTTP без кэширования."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        # Маскировка под браузер + жесткий запрет кэширования на стороне биржи
         s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "Cache-Control": "no-cache, no-store, must-revalidate",
             "Pragma": "no-cache",
             "Expires": "0"
@@ -397,7 +392,6 @@ def _fetch_upbit() -> Optional[float]:
 
 
 def _fetch_bithumb() -> Optional[float]:
-    # Вариант 1: новый v1 endpoint
     try:
         r = _get_session().get(
             f"https://api.bithumb.com/v1/ticker?markets=KRW-USDT&_t={int(time.time() * 1000)}",
@@ -411,7 +405,6 @@ def _fetch_bithumb() -> Optional[float]:
                 return float(price)
     except Exception:
         pass
-    # Вариант 2: старый public endpoint (fallback)
     try:
         r = _get_session().get(
             f"https://api.bithumb.com/public/ticker/USDT_KRW?_t={int(time.time() * 1000)}",
@@ -422,32 +415,65 @@ def _fetch_bithumb() -> Optional[float]:
         if price:
             return float(price)
     except Exception as exc:
-        logger.warning("Bithumb (оба варианта): %s", exc)
+        logger.warning("Bithumb: %s", exc)
     return None
 
 
 def _fetch_krw_rub() -> Optional[float]:
+    """ГЛУБОКИЙ ПАРСИНГ GOOGLE FINANCE С 3-МЯ УРОВНЯМИ ЗАЩИТЫ ОТ СБОЕВ"""
+    
+    # Специфичные заголовки для Google, чтобы он думал, что мы из Chrome браузера
+    google_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+
     try:
+        # 1. Запрашиваем Google Finance
         url = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&_t={int(time.time() * 1000)}"
-        r = _get_session().get(url, timeout=_API_TIMEOUT)
+        r = _get_session().get(url, headers=google_headers, timeout=_API_TIMEOUT)
         r.raise_for_status()
-        match = re.search(r'data-last-price="([0-9.]+)"', r.text)
-        if match:
-            price = float(match.group(1))
+
+        # 2. Ищем курс по нескольким паттернам (Google постоянно меняет верстку!)
+        
+        # Паттерн А: Современный класс Google Finance
+        match_a = re.search(r'class="YMlKec fxKbKc">([0-9.,]+)</div>', r.text)
+        # Паттерн B: Старый атрибут data-last-price (на всякий случай)
+        match_b = re.search(r'data-last-price="([0-9.]+)"', r.text)
+        # Паттерн C: Скрытый мета-тег для поисковиков
+        match_c = re.search(r'<meta itemprop="price" content="([0-9.]+)"', r.text)
+
+        raw_price = None
+        if match_a:
+            raw_price = match_a.group(1).replace(',', '.') # Убираем запятые, если Google выдал русскую локаль
+        elif match_b:
+            raw_price = match_b.group(1)
+        elif match_c:
+            raw_price = match_c.group(1)
+
+        # 3. Применяем курс, если он найден
+        if raw_price:
+            price = float(raw_price)
             if price > 0:
                 return price * 1_000_000
     except Exception as exc:
-        logger.warning("Google Finance: %s", exc)
+        logger.warning("Google Finance не спарсился: %s", exc)
 
+    # === РЕЗЕРВНЫЙ ВАРИАНТ, ЕСЛИ GOOGLE ВООБЩЕ ЛЕЖИТ ИЛИ ЗАБЛОКИРОВАЛ IP ===
     try:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?region=US&lang=en-US&includePrePost=false&interval=1m&useYfid=true&range=1d&_t={int(time.time() * 1000)}"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X?interval=1m&range=1d&_t={int(time.time() * 1000)}"
         r = _get_session().get(url, timeout=_API_TIMEOUT)
         r.raise_for_status()
         price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
         if price and float(price) > 0:
             return float(price) * 1_000_000
     except Exception as exc:
-        logger.warning("Yahoo Finance: %s", exc)
+        logger.warning("Yahoo Finance также недоступен: %s", exc)
 
     return None
 
@@ -467,7 +493,6 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
 
 
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
-    """Получает результат future с жёстким таймаутом. Никогда не бросает исключение."""
     try:
         return future.result(timeout=_API_MAX_WAIT)
     except concurrent.futures.TimeoutError:
@@ -480,7 +505,6 @@ def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
 
 
 def fetch_all_rates() -> Dict[str, Optional[float]]:
-    """Полный запрос всех источников (для кнопки 'Показать курс')."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
@@ -495,7 +519,6 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
-    """Лёгкий запрос только для авто-рассылки (Upbit + ABCEX + KRW/RUB)."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fr = pool.submit(_fetch_krw_rub)
@@ -529,10 +552,6 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
 
 
 def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
-    """
-    Компактное авто-сообщение.
-    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
-    """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
     ab_sell  = rates.get("ab_sell")
@@ -598,10 +617,8 @@ def msg_show_rate(m: types.Message) -> None:
     lang = get_lang(uid)
     T    = LANGS[lang]
 
-    # 1. Мгновенно восстанавливаем клавиатуру
     bot.send_message(m.chat.id, "⏳", reply_markup=main_keyboard(uid))
 
-    # 2. Анимация . → .. → ...
     anim = bot.send_message(m.chat.id, ".")
     time.sleep(0.4)
     try:
@@ -614,11 +631,9 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
-    # 3. Запрашиваем курсы
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
-    # 4. Удаляем анимацию
     try:
         bot.delete_message(m.chat.id, anim.message_id)
     except Exception:
@@ -629,7 +644,6 @@ def msg_show_rate(m: types.Message) -> None:
         log_action(m.from_user, "Курс", result="⚠️ все API недоступны")
         return
 
-    # 5. Отправляем курс
     bot.send_message(m.chat.id, build_rate_message(rates, lang), parse_mode="HTML")
 
     with _DATA_LOCK:
@@ -1078,19 +1092,11 @@ def _auto_worker() -> None:
 #  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
-    """
-    Решает ВСЕ выявленные проблемы с засыпанием Render free tier.
-    
-    1. Иллюзия исходящего трафика: Render не спит только от ВХОДЯЩЕГО трафика по публичному URL.
-    2. Кэширование балансировщика: Запросы /ping закэшируются балансировщиком Cloudflare. Добавлен параметр ?t=...
-    3. Маскировка заголовков: Firewall часто режет пустые пинги от скриптов Python. Добавлены реальные User-Agent.
-    """
-    _INTERVAL   = 10 * 60   # 10 минут (лимит Render - 15 мин, нужен запас)
+    _INTERVAL   = 10 * 60
     _PING_AGENT = requests.Session()
     
-    # Добавляем реальные заголовки браузера, чтобы пройти фаерволы Cloudflare/Render
     _PING_AGENT.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Cache-Control": "no-cache",
@@ -1099,12 +1105,10 @@ def _anti_sleep_worker() -> None:
 
     if not RENDER_URL:
         logger.error("🚨 КРИТИЧЕСКАЯ ОШИБКА АНТИ-СНА: Переменная RENDER_URL не задана!")
-        logger.error("🚨 Бот УСНЕТ через 15 минут. Добавьте RENDER_URL (например, https://my-bot.onrender.com) в Environment Variables на Render.")
         return 
 
     def _ping_self() -> None:
         try:
-            # Добавляем случайный параметр ?t=..., чтобы Render CDN гарантированно не кэшировал запрос
             url = f"{RENDER_URL}/ping?t={int(time.time())}"
             r = _PING_AGENT.get(url, timeout=15)
             logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
@@ -1113,7 +1117,7 @@ def _anti_sleep_worker() -> None:
 
     logger.info("🏓 anti_sleep: запущен (интервал %d мин). Цель: %s", _INTERVAL // 60, RENDER_URL)
 
-    time.sleep(5)  # ждём 5 сек чтобы Flask успел подняться
+    time.sleep(5)
     _ping_self()
 
     while True:
