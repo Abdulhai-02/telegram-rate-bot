@@ -9,6 +9,7 @@ import logging
 import threading
 import time
 import concurrent.futures
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -422,7 +423,7 @@ def _fetch_bithumb() -> Optional[float]:
 
 # ── Кэш Google-курса KRW/RUB ──────────────────────────────────────────
 # Хранит последнее успешно полученное значение и время запроса.
-# Фоновый поток обновляет его каждые 30 минут независимо от запросов.
+# Фоновый поток обновляет его каждые 5 минут независимо от запросов.
 _krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
 _krw_google_lock  = threading.Lock()
 
@@ -431,7 +432,7 @@ def _fetch_krw_rub_google() -> Optional[float]:
     """
     Справочный курс KRW→RUB.
     Сначала возвращает кэш (мгновенно), фоновый поток обновляет
-    его каждые 30 мин. При первом запросе делает запрос сразу.
+    его каждые 5 мин. При первом запросе делает запрос сразу.
     """
     with _krw_google_lock:
         cached = _krw_google_cache["value"]
@@ -442,7 +443,47 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Реальный запрос к open.er-api.com. Обновляет кэш."""
+    """
+    Парсит живой курс KRW/RUB прямо со страницы (имитация браузера).
+    Обновляет кэш.
+    """
+    # Используем XE.com или аналогичный живой ресурс
+    url = "https://www.xe.com/currencyconverter/convert/?Amount=1000000&From=KRW&To=RUB"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        
+        # Ищем паттерн цены в тексте
+        match = re.search(r'(\d[0-9\s,.]*)\s?Russian Rubles', r.text)
+        
+        if match:
+            raw_val = match.group(1).replace(",", "").replace(" ", "")
+            result = float(raw_val)
+            
+            with _krw_google_lock:
+                _krw_google_cache["value"]   = result
+                _krw_google_cache["updated"] = now_msk()
+            
+            logger.info("Парсинг XE.com успешен: %.2f", result)
+            return result
+        else:
+            logger.warning("Не удалось найти цифру курса на странице XE")
+            
+    except Exception as exc:
+        logger.error("Ошибка парсинга страницы: %s", exc)
+    
+    # Если парсинг не удался, пробуем старый API как резерв
+    return _refresh_krw_google_fallback()
+
+
+def _refresh_krw_google_fallback() -> Optional[float]:
+    """Резервный метод через API, если парсинг страницы не сработал."""
     for url in (
         "https://open.er-api.com/v6/latest/RUB",
         "https://v6.exchangerate-api.com/v6/latest/RUB",
@@ -456,29 +497,28 @@ def _refresh_krw_google() -> Optional[float]:
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
                     _krw_google_cache["updated"] = now_msk()
-                logger.info("Google KRW/RUB обновлён: %.2f", result)
+                logger.info("Google KRW/RUB (fallback) обновлён: %.2f", result)
                 return result
         except Exception as exc:
-            logger.warning("_refresh_krw_google [%s]: %s", url, exc)
+            logger.warning("_refresh_krw_google_fallback [%s]: %s", url, exc)
             continue
     return None
 
 
 def _krw_google_updater() -> None:
     """
-    Фоновый поток: обновляет Google-курс каждые 30 минут.
+    Фоновый поток: обновляет Google-курс каждые 5 минут.
     Запускается при старте бота. Не зависит от запросов пользователей.
     """
-    logger.info("🔄 krw_google_updater: запущен (каждые 30 мин)")
+    logger.info("🔄 krw_google_updater: запущен (каждые 5 мин)")
     # Первое обновление сразу при старте
     _refresh_krw_google()
     while True:
-        time.sleep(30 * 60)   # 30 минут
+        time.sleep(5 * 60)   # 5 минут
         try:
             _refresh_krw_google()
         except Exception as exc:
             logger.error("krw_google_updater: %s", exc)
-
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
