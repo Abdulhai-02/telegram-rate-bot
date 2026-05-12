@@ -585,11 +585,11 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         """Строка курса с Google в скобках."""
         if val is not None and krw_google is not None:
             return (
-                f"<b>{fmt_num(val, 2)} ₽</b>"
+                f"<b>{fmt_num(val, 0)} ₽</b>"
                 f"  ({fmt_num(krw_google, 0)} ₽)"
             )
         if val is not None:
-            return f"<b>{fmt_num(val, 2)} ₽</b>"
+            return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
     return (
