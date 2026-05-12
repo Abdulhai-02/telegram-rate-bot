@@ -477,12 +477,12 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         fb = pool.submit(_fetch_bithumb)
         fg = pool.submit(_fetch_krw_rub_google)
         fa = pool.submit(_fetch_abcex)
-        upbit       = _safe_future(fu)
-        bithumb     = _safe_future(fb)
-        krw_google  = _safe_future(fg)   # справочный курс (скобки)
-        abcex       = _safe_future(fa, default=(None, None))
+        upbit      = _safe_future(fu)
+        bithumb    = _safe_future(fb)
+        krw_google = _safe_future(fg)
+        abcex      = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    # Основной курс KRW→RUB: кросс через USDT + 0.55% наценка
+    # KRW→RUB кросс через USDT (среднее bid/ask) + 0.6%
     usdt_rub_mid = None
     if ab_buy is not None and ab_sell is not None:
         usdt_rub_mid = (ab_buy + ab_sell) / 2
@@ -490,60 +490,68 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         usdt_rub_mid = ab_buy
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
-    if upbit and upbit > 0 and usdt_rub_mid:
-        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.0055
-    else:
-        krw_rub = None
+    krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.006 if (upbit and upbit > 0 and usdt_rub_mid) else None
     return {
         "upbit":      upbit,
         "bithumb":    bithumb,
-        "krw_rub":    krw_rub,      # кросс USDT + 0.55% (основной)
-        "krw_google": krw_google,   # open.er-api (справочный, в скобках)
-        "ab_buy":     ab_buy,
+        "krw_rub":    krw_rub,     # кросс USDT + 0.6% (основной)
+        "krw_google": krw_google,  # open.er-api (справочный, в скобках)
+        "ab_buy":     ab_buy,      # сырые данные ABCEX
         "ab_sell":    ab_sell,
     }
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
-    """Лёгкий запрос для авто-рассылки (Upbit + ABCEX, KRW/RUB кросс через USDT)."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+    """
+    Запрос для авто-рассылки.
+    Содержит: Upbit (вон), ABCEX (USDT), Google KRW/RUB.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fa = pool.submit(_fetch_abcex)
-        upbit = _safe_future(fu)
-        abcex = _safe_future(fa, default=(None, None))
+        fg = pool.submit(_fetch_krw_rub_google)
+        upbit      = _safe_future(fu)
+        abcex      = _safe_future(fa, default=(None, None))
+        krw_google = _safe_future(fg)
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    usdt_rub_mid = None
-    if ab_buy is not None and ab_sell is not None:
-        usdt_rub_mid = (ab_buy + ab_sell) / 2
-    elif ab_buy is not None:
-        usdt_rub_mid = ab_buy
-    elif ab_sell is not None:
-        usdt_rub_mid = ab_sell
-    if upbit and upbit > 0 and usdt_rub_mid:
-        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.0055
-    else:
-        krw_rub = None
-    return {"upbit": upbit, "krw_rub": krw_rub, "ab_buy": ab_buy, "ab_sell": ab_sell}
+    return {"upbit": upbit, "ab_buy": ab_buy, "ab_sell": ab_sell, "krw_google": krw_google}
 
 
 def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     T  = LANGS[lang]
     ts = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
 
-    # ABCEX покупка +0.55% наценка
+    # ── ABCEX: чистые цены без изменений ──────────────────────────
     ab_buy_raw  = rates.get("ab_buy")
-    ab_buy_show = (ab_buy_raw * 1.0055) if ab_buy_raw is not None else None
+    ab_sell_raw = rates.get("ab_sell")
 
-    # KRW→RUB: основной (кросс+0.55%) и справочный гугл в скобках
-    krw_main   = rates.get("krw_rub")    # кросс через USDT + 0.55%
-    krw_google = rates.get("krw_google") # open.er-api (справочный)
+    # ── KRW→RUB: три строки ───────────────────────────────────────
+    # ◾ Кросс (среднее bid/ask +0.6%) — основной с Google в скобках
+    # 🟢 Покупка: ab_buy  * 1.006  (Google в скобках)
+    # 🔴 Продажа: ab_sell * 1.006  (Google в скобках)
+    krw_main   = rates.get("krw_rub")    # кросс mid +0.6% (из fetch)
+    krw_google = rates.get("krw_google") # Google (open.er-api)
 
-    if krw_main is not None and krw_google is not None:
-        krw_line = f"<b>{fmt_num(krw_main, 2)} ₽</b>  ({fmt_num(krw_google, 2)} ₽)"
-    elif krw_main is not None:
-        krw_line = f"<b>{fmt_num(krw_main, 2)} ₽</b>"
-    else:
-        krw_line = "—"
+    # ab_buy/sell → KRW/RUB через кросс с наценкой 0.6%
+    upbit = rates.get("upbit")
+    def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
+        if usdt_price and upbit and upbit > 0:
+            return (1_000_000 * usdt_price / upbit) * 1.006
+        return None
+
+    krw_buy  = krw_from_usdt(ab_buy_raw)   # покупка +0.6%
+    krw_sell = krw_from_usdt(ab_sell_raw)  # продажа +0.6%
+
+    def krw_line_fmt(val: Optional[float]) -> str:
+        """Строка курса с Google в скобках."""
+        if val is not None and krw_google is not None:
+            return (
+                f"<b>{fmt_num(val, 2)} ₽</b>"
+                f"  ({fmt_num(krw_google, 2)} ₽ - Google)"
+            )
+        if val is not None:
+            return f"<b>{fmt_num(val, 2)} ₽</b>"
+        return "—"
 
     return (
         f"{T['rate_title']}\n\n"
@@ -552,11 +560,13 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"  ◾ BITHUMB:  <b>{fmt_num(rates.get('bithumb'), 0)} ₩</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇷🇺 <b>USDT → RUB  (ABCEX)</b>\n"
-        f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_show, 2)} ₽</b>\n"
-        f"  🔴 {T['sell']}:  <b>{fmt_num(rates.get('ab_sell'), 2)} ₽</b>\n"
+        f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_raw,  2)} ₽</b>\n"
+        f"  🔴 {T['sell']}:  <b>{fmt_num(ab_sell_raw, 2)} ₽</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇰🇷➡️🇷🇺 <b>KRW → RUB</b>\n"
-        f"  ◾ 1 000 000 ₩ → {krw_line}\n"
+        f"  ◾ 1 000 000 ₩ → {krw_line_fmt(krw_main)}\n"
+        f"  🟢 {T['buy']}:   {krw_line_fmt(krw_buy)}\n"
+        f"  🔴 {T['sell']}:  {krw_line_fmt(krw_sell)}\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"{T['updated']} <b>{ts}</b>\n\n"
         f"{T['contact']}"
@@ -567,10 +577,16 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     """
     Компактное авто-сообщение.
     Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+    Курс вона — Upbit (без процентов).
+    Курс USDT — ABCEX (без процентов, среднее bid/ask).
+    Курс KRW→RUB — только Google (open.er-api).
     """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
     ab_sell  = rates.get("ab_sell")
+    krw_google = rates.get("krw_google")
+
+    # USDT/RUB среднее без наценки
     if ab_buy is not None and ab_sell is not None:
         usdt_rub: Optional[float] = (ab_buy + ab_sell) / 2
     elif ab_buy is not None:
@@ -579,11 +595,10 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
         usdt_rub = ab_sell
     else:
         usdt_rub = None
-    krw_rub = rates.get("krw_rub")
 
-    part_krw     = f"{fmt_num(usdt_krw, 0)} ₩" if usdt_krw is not None else "— ₩"
-    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"  if usdt_rub is not None else "— ₽"
-    part_krw_rub = f"{int(round(krw_rub)):,} ₽"  if krw_rub  is not None else "— ₽"
+    part_krw = f"{fmt_num(usdt_krw, 0)} ₩"        if usdt_krw   is not None else "— ₩"
+    part_rub = f"{fmt_num(usdt_rub, 2)} ₽"         if usdt_rub   is not None else "— ₽"
+    part_krw_rub = f"{int(round(krw_google)):,} ₽" if krw_google is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
 
