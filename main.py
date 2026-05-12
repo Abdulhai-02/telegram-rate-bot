@@ -521,7 +521,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         krw_google = _safe_future(fg)
         abcex      = _safe_future(fa, default=(None, None))
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    # KRW→RUB кросс через USDT (среднее bid/ask) + 0.6%
+    # KRW→RUB кросс через USDT (среднее bid/ask) - 0.6%
     usdt_rub_mid = None
     if ab_buy is not None and ab_sell is not None:
         usdt_rub_mid = (ab_buy + ab_sell) / 2
@@ -529,11 +529,11 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         usdt_rub_mid = ab_buy
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
-    krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.006 if (upbit and upbit > 0 and usdt_rub_mid) else None
+    krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994 if (upbit and upbit > 0 and usdt_rub_mid) else None
     return {
         "upbit":      upbit,
         "bithumb":    bithumb,
-        "krw_rub":    krw_rub,     # кросс USDT + 0.6% (основной)
+        "krw_rub":    krw_rub,     # кросс USDT - 0.6% (основной)
         "krw_google": krw_google,  # open.er-api (справочный, в скобках)
         "ab_buy":     ab_buy,      # сырые данные ABCEX
         "ab_sell":    ab_sell,
@@ -565,21 +565,21 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     ab_sell_raw = rates.get("ab_sell")
 
     # ── KRW→RUB: три строки ───────────────────────────────────────
-    # ◾ Кросс (среднее bid/ask +0.6%) — основной с Google в скобках
-    # 🟢 Покупка: ab_buy  * 1.006  (Google в скобках)
-    # 🔴 Продажа: ab_sell * 1.006  (Google в скобках)
-    krw_main   = rates.get("krw_rub")    # кросс mid +0.6% (из fetch)
+    # ◾ Кросс (среднее bid/ask -0.6%) — основной с Google в скобках
+    # 🟢 Покупка: ab_buy  * 0.994  (Google в скобках)
+    # 🔴 Продажа: ab_sell * 0.994  (Google в скобках)
+    krw_main   = rates.get("krw_rub")    # кросс mid -0.6% (из fetch)
     krw_google = rates.get("krw_google") # Google (open.er-api)
 
-    # ab_buy/sell → KRW/RUB через кросс с наценкой 0.6%
+    # ab_buy/sell → KRW/RUB через кросс с вычетом 0.6%
     upbit = rates.get("upbit")
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
-            return (1_000_000 * usdt_price / upbit) * 1.006
+            return (1_000_000 * usdt_price / upbit) * 0.994
         return None
 
-    krw_buy  = krw_from_usdt(ab_buy_raw)   # покупка +0.6%
-    krw_sell = krw_from_usdt(ab_sell_raw)  # продажа +0.6%
+    krw_buy  = krw_from_usdt(ab_buy_raw)   # покупка -0.6%
+    krw_sell = krw_from_usdt(ab_sell_raw)  # продажа -0.6%
 
     def krw_line_fmt(val: Optional[float]) -> str:
         """Строка курса с Google в скобках."""
