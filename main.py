@@ -586,7 +586,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         if val is not None and krw_google is not None:
             return (
                 f"<b>{fmt_num(val, 2)} ₽</b>"
-                f"  ({fmt_num(krw_google, 2)} ₽)"
+                f"  ({fmt_num(krw_google, 0)} ₽)"
             )
         if val is not None:
             return f"<b>{fmt_num(val, 2)} ₽</b>"
@@ -874,7 +874,7 @@ def msg_admin_panel(m: types.Message) -> None:
     init_user(m.from_user)
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("📊 Статистика",             callback_data="adm_stat"),
+        types.InlineKeyboardButton("📊 Статистика",              callback_data="adm_stat"),
         types.InlineKeyboardButton("👥 База пользователей",      callback_data="adm_users_0"),
         types.InlineKeyboardButton("📢 Рассылка всем",          callback_data="adm_bc"),
         types.InlineKeyboardButton("🔔 Упр. подписками (тихо)", callback_data="adm_auto_menu"),
@@ -957,7 +957,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
         auto_info = (
             f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
             f"  ⏱ Интервал:            <b>каждые {a['interval']//3600}H</b>\n"
-            f"  📅 Включено:           {fmt_dt(a.get('enabled_at'))}\n"
+            f"  📅 Включено:            {fmt_dt(a.get('enabled_at'))}\n"
             f"  📤 Последняя отправка: {fmt_dt(a.get('last'))}"
         ) if a else "\n🔴 <b>Автообновление: ВЫКЛЮЧЕНО</b>"
         text = (
