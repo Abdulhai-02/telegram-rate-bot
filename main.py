@@ -420,12 +420,29 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
+# ── Кэш Google-курса KRW/RUB ──────────────────────────────────────────
+# Хранит последнее успешно полученное значение и время запроса.
+# Фоновый поток обновляет его каждые 30 минут независимо от запросов.
+_krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
+_krw_google_lock  = threading.Lock()
+
+
 def _fetch_krw_rub_google() -> Optional[float]:
     """
-    Справочный курс KRW→RUB с open.er-api.com (обновляется раз в сутки).
-    Показывается в скобках рядом с основным курсом.
-    Используем requests.get() напрямую как в оригинале — без сессии.
+    Справочный курс KRW→RUB.
+    Сначала возвращает кэш (мгновенно), фоновый поток обновляет
+    его каждые 30 мин. При первом запросе делает запрос сразу.
     """
+    with _krw_google_lock:
+        cached = _krw_google_cache["value"]
+    if cached is not None:
+        return cached
+    # Первый запрос — берём напрямую
+    return _refresh_krw_google()
+
+
+def _refresh_krw_google() -> Optional[float]:
+    """Реальный запрос к open.er-api.com. Обновляет кэш."""
     for url in (
         "https://open.er-api.com/v6/latest/RUB",
         "https://v6.exchangerate-api.com/v6/latest/RUB",
@@ -435,10 +452,32 @@ def _fetch_krw_rub_google() -> Optional[float]:
             r.raise_for_status()
             krw = r.json()["rates"].get("KRW")
             if krw and float(krw) > 0:
-                return 1_000_000 / float(krw)
-        except Exception:
+                result = 1_000_000 / float(krw)
+                with _krw_google_lock:
+                    _krw_google_cache["value"]   = result
+                    _krw_google_cache["updated"] = now_msk()
+                logger.info("Google KRW/RUB обновлён: %.2f", result)
+                return result
+        except Exception as exc:
+            logger.warning("_refresh_krw_google [%s]: %s", url, exc)
             continue
     return None
+
+
+def _krw_google_updater() -> None:
+    """
+    Фоновый поток: обновляет Google-курс каждые 30 минут.
+    Запускается при старте бота. Не зависит от запросов пользователей.
+    """
+    logger.info("🔄 krw_google_updater: запущен (каждые 30 мин)")
+    # Первое обновление сразу при старте
+    _refresh_krw_google()
+    while True:
+        time.sleep(30 * 60)   # 30 минут
+        try:
+            _refresh_krw_google()
+        except Exception as exc:
+            logger.error("krw_google_updater: %s", exc)
 
 
 
@@ -547,7 +586,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         if val is not None and krw_google is not None:
             return (
                 f"<b>{fmt_num(val, 2)} ₽</b>"
-                f"  ({fmt_num(krw_google, 2)} ₽ - Google)"
+                f"  ({fmt_num(krw_google, 2)} ₽)"
             )
         if val is not None:
             return f"<b>{fmt_num(val, 2)} ₽</b>"
@@ -1223,6 +1262,7 @@ if __name__ == "__main__":
 
     threading.Thread(target=_auto_worker,       daemon=True, name="auto_worker").start()
     threading.Thread(target=_anti_sleep_worker, daemon=True, name="anti_sleep").start()
+    threading.Thread(target=_krw_google_updater, daemon=True, name="krw_google").start()
 
     port = int(os.environ.get("PORT", 10_000))
     threading.Thread(
