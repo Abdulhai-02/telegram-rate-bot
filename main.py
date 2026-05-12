@@ -444,64 +444,70 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 def _refresh_krw_google() -> Optional[float]:
     """
-    Парсит живой курс KRW/RUB прямо со страницы (имитация браузера).
+    Парсит курс напрямую из поисковой выдачи Google (как на телефоне).
     Обновляет кэш.
     """
-    # Используем XE.com или аналогичный живой ресурс
-    url = "https://www.xe.com/currencyconverter/convert/?Amount=1000000&From=KRW&To=RUB"
-    
+    url = "https://www.google.com/search?q=1000000+krw+to+rub&hl=ru"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8"
     }
 
     try:
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         
-        # Ищем паттерн цены в тексте
-        match = re.search(r'(\d[0-9\s,.]*)\s?Russian Rubles', r.text)
+        # Google прячет точный курс в атрибут data-value
+        match = re.search(r'data-value="([\d.]+)"', r.text)
         
+        # Если data-value не найден, ищем просто по тексту
+        if not match:
+            match = re.search(r'(\d[\d\s\xa0]*[,.]?\d*)\s*(?:Российск[а-я]* рубл[а-я]*|RUB)', r.text, re.IGNORECASE)
+            
         if match:
-            raw_val = match.group(1).replace(",", "").replace(" ", "")
+            raw_val = match.group(1).replace('\xa0', '').replace(' ', '').replace(',', '.')
             result = float(raw_val)
             
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
             
-            logger.info("Парсинг XE.com успешен: %.2f", result)
+            logger.info("Парсинг Google Search успешен: %.2f", result)
             return result
         else:
-            logger.warning("Не удалось найти цифру курса на странице XE")
+            logger.warning("Не удалось найти цифру курса в выдаче Google")
             
     except Exception as exc:
-        logger.error("Ошибка парсинга страницы: %s", exc)
+        logger.error("Ошибка парсинга Google: %s", exc)
     
-    # Если парсинг не удался, пробуем старый API как резерв
+    # Если парсинг не удался (например Google запросил капчу), работает резерв
     return _refresh_krw_google_fallback()
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Резервный метод через API, если парсинг страницы не сработал."""
-    for url in (
-        "https://open.er-api.com/v6/latest/RUB",
-        "https://v6.exchangerate-api.com/v6/latest/RUB",
-    ):
-        try:
-            r = requests.get(url, timeout=7)
-            r.raise_for_status()
-            krw = r.json()["rates"].get("KRW")
-            if krw and float(krw) > 0:
-                result = 1_000_000 / float(krw)
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("Google KRW/RUB (fallback) обновлён: %.2f", result)
-                return result
-        except Exception as exc:
-            logger.warning("_refresh_krw_google_fallback [%s]: %s", url, exc)
-            continue
+    """Резервный метод через Yahoo Finance, если Google заблокировал запрос."""
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        
+        data = r.json()
+        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        
+        if price and float(price) > 0:
+            result = 1_000_000 * float(price)
+            with _krw_google_lock:
+                _krw_google_cache["value"]   = result
+                _krw_google_cache["updated"] = now_msk()
+            logger.info("Yahoo Finance (резерв) успешен: %.2f", result)
+            return result
+    except Exception as exc:
+        logger.error("Ошибка резервного API Yahoo Finance: %s", exc)
+        
     return None
 
 
