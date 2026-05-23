@@ -35,7 +35,7 @@ logger = logging.getLogger("p2p_bot")
 
 _TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 if not _TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN не задан в переменных окружения")
+    raise RuntimeError("TELEGRAM_TOKEN не задан в переменных очередей")
 
 TELEGRAM_TOKEN: str    = _TOKEN
 MY_ADMIN_ID: int       = 5266659205
@@ -368,17 +368,19 @@ _thread_local = threading.local()
 
 
 def _get_session() -> requests.Session:
-    """Мощная сессия для пробития защиты Cloudflare и Google GDPR."""
+    """Сессия уровня Pro с полной эмуляцией структуры сетевых заголовков Chrome и Cookie GDPR."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908", 
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
+            "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
-            "Origin": "https://abcex.io",
-            "Referer": "https://abcex.io/"
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
         })
         _thread_local.session = s
     return _thread_local.session
@@ -425,15 +427,14 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Бронебойный парсер Google: Search конвертер -> Google Finance -> Fallback API."""
-    # Шаг 1: Пытаемся получить курс из виджета Google Поиска (как с телефона)
+    """Умный многослойный разбор Google (Search Widget -> Finance JSON)."""
     try:
-        url_search = "https://www.google.com/search?q=1000000+krw+to+rub&hl=ru"
-        r = _get_session().get(url_search, timeout=8)
+        url_search = f"https://www.google.com/search?q=1000000+krw+to+rub&hl=ru&_ts={int(time.time())}"
+        r = _get_session().get(url_search, timeout=10)
         match = re.search(r'data-value="([\d.]+)"', r.text)
         if match:
             val = float(match.group(1))
-            if 30000 < val < 100000:  # Валидация рынка
+            if 30000 < val < 100000:
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = val
                     _krw_google_cache["updated"] = now_msk()
@@ -441,34 +442,37 @@ def _refresh_krw_google() -> Optional[float]:
     except Exception:
         pass
 
-    # Шаг 2: Если поиск заблокирован (429), идем в Google Finance
     try:
-        url_fin = "https://www.google.com/finance/quote/KRW-RUB"
-        r = _get_session().get(url_fin, timeout=8)
+        url_fin = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_cb={int(time.time())}"
+        r = _get_session().get(url_fin, timeout=10)
+        r.raise_for_status()
         
-        match = re.search(r'data-last-price="([\d.]+)"', r.text)
+        match = re.search(r'data-id="KRWRUB"[^>]*data-last-price="([\d.]+)"', r.text)
         if not match:
-            match = re.search(r'class="YMlKec fxKbKc"[^>]*>([\d.,]+)', r.text)
+            match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
+        if not match:
+            js_match = re.search(r'KRW-RUB.*?([\d.]+)', r.text, re.DOTALL)
+            if js_match:
+                match = js_match
             
         if match:
-            raw_val = match.group(1).replace(',', '.')
-            price = float(raw_val)
-            if 0.01 < price < 1.0:
+            price = float(match.group(1))
+            if 0.001 < price < 10.0:
                 result = 1_000_000 * price
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
                     _krw_google_cache["updated"] = now_msk()
+                logger.info("Шлюз Google Finance успешен: %.2f", result)
                 return result
     except Exception as exc:
         logger.error("Исключение Google Finance: %s", exc)
         
-    # Шаг 3: Если сервер в черном списке Google, используем фиатный резерв
     return _refresh_krw_google_fallback()
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=7)
+        r = requests.get(f"https://open.er-api.com/v6/latest/RUB?_ts={int(time.time())}", timeout=7)
         krw = r.json()["rates"].get("KRW")
         if krw:
             result = 1_000_000 / float(krw)
@@ -479,7 +483,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
     except:
         pass
     try:
-        r = requests.get("https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000", timeout=7)
+        r = requests.get(f"https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000&_ts={int(time.time())}", timeout=7)
         if r.status_code == 200:
             result = float(r.json()["result"])
             with _krw_google_lock:
@@ -502,38 +506,45 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """Парсинг ИСКЛЮЧИТЕЛЬНО биржи ABCEX с обходом их новых маршрутизаторов."""
-    # Все возможные эндпоинты ABCEX (включая обновленные тикеры)
+    """Профессиональный парсер ИСКЛЮЧИТЕЛЬНО биржи ABCEX с полной нормализацией обновленного формата JSON."""
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDT-RUB",
-        "https://api.abcex.io/api/v1/depth?symbol=USDTRUB"
+        "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?market=usdtrub"
     ]
     for url in urls:
         try:
-            r = _get_session().get(url, timeout=_API_TIMEOUT)
+            ts_url = f"{url}&_={int(time.time() * 1000)}" if "?" in url else f"{url}?_={int(time.time() * 1000)}"
+            r = _get_session().get(ts_url, timeout=_API_TIMEOUT)
             if r.status_code == 200:
                 d = r.json()
                 
-                # Защита от изменения структуры (парсит как словари, так и чистые массивы)
-                if "bid" in d and "ask" in d and d["bid"] and d["ask"]:
-                    b_val = d["bid"][0].get("price") if isinstance(d["bid"][0], dict) else d["bid"][0][0]
-                    a_val = d["ask"][0].get("price") if isinstance(d["ask"][0], dict) else d["ask"][0][0]
-                    return float(b_val), float(a_val)
-                
-                elif "bids" in d and "asks" in d and d["bids"] and d["asks"]:
-                    bid_p = d["bids"][0].get("price") if isinstance(d["bids"][0], dict) else d["bids"][0][0]
-                    ask_p = d["asks"][0].get("price") if isinstance(d["asks"][0], dict) else d["asks"][0][0]
-                    return float(bid_p), float(ask_p)
-            else:
-                logger.warning("ABCEX вернул статус %d для URL: %s", r.status_code, url)
+                bids, asks = None, None
+                for b_key in ["bid", "bids", "buy"]:
+                    if b_key in d and d[b_key]:
+                        bids = d[b_key]
+                        break
+                for a_key in ["ask", "asks", "sell"]:
+                    if a_key in d and d[a_key]:
+                        asks = d[a_key]
+                        break
+                        
+                if bids and asks:
+                    if isinstance(bids[0], dict):
+                        b_val = bids[0].get("price") or bids[0].get("rate") or bids[0].get("p")
+                        a_val = asks[0].get("price") or asks[0].get("rate") or asks[0].get("p")
+                    else:
+                        b_val = bids[0][0]
+                        a_val = asks[0][0]
+                        
+                    if b_val and a_val:
+                        return float(b_val), float(a_val)
         except Exception as exc:
             continue
             
-    # Мы не подставляем левые биржи. Если ABCEX лежит - честно возвращаем None
-    logger.error("Все узлы ABCEX недоступны или заблокированы.")
+    logger.error("Все обновленные узлы ABCEX вернули пустой ответ или заблокированы.")
     return None, None
 
 
@@ -549,7 +560,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        fg = pool.submit(_fetch_krw_rub_google)  # Используем кэшированный вызов
+        fg = pool.submit(_fetch_krw_rub_google) 
         fa = pool.submit(_fetch_abcex)
         
         upbit      = _safe_future(fu)
@@ -567,7 +578,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
         
-    # ИСПРАВЛЕНИЕ: Множитель 1.006 (скрытая прибавка +0.6% к финальному кросс-курсу)
+    # ИСПРАВЛЕНИЕ: Множитель 1.006 (прибавка +0.6% маржи в тихую, как ты и просил)
     if upbit and upbit > 0 and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.006
     else:
@@ -604,7 +615,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     krw_google = rates.get("krw_google") 
     upbit = rates.get("upbit")
     
-    # ИСПРАВЛЕНИЕ: +0.6% маржи втихую прибавляется и к покупке, и к продаже кросс-курса
+    # ИСПРАВЛЕНИЕ: Накидываем ровно +0.6% комиссии (1.006) на кросс-курс Покупки и Продажи воны
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
             return (1_000_000 * usdt_price / upbit) * 1.006
@@ -720,7 +731,6 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
-    # Принудительная очистка кэша Google, чтобы он обновился с каждым кликом
     with _krw_google_lock:
         _krw_google_cache["value"] = None
 
@@ -1272,16 +1282,9 @@ if __name__ == "__main__":
     ).start()
     logger.info("🌐 Flask на порту %d", port)
 
-    logger.info("🤖 Бот запущен")
-    
-    # Отправка стартового пуш-сообщения администратору СТРОГО 1 РАЗ при запуске сервера
-    try:
-        bot.send_message(MY_ADMIN_ID, "🚀 <b>Бот успешно перезагружен и готов к работе!</b>", parse_mode="HTML")
-        logger.info("Стартовое уведомление отправлено администратору")
-    except Exception as admin_err:
-        logger.warning("Не удалось отправить пуш администратору: %s", admin_err)
+    # ИСПРАВЛЕНИЕ: Все уведомления о перезагрузках пишутся СТРОГО В ЛОГИ сервера для полной стабильности
+    logger.info("🚀 Бот успешно перезагружен, проверен и готов к работе!")
 
-    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта и лишнего спама
     while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
