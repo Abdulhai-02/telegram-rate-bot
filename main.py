@@ -118,7 +118,7 @@ LANGS: Dict[str, Dict[str, str]] = {
         "auto_on_msg":  "Уведомление включено каждые",
         "feedback_ask": "Напишите ваш отзыв одним сообщением:",
         "feedback_ok":  "✅ Спасибо! Ваш отзыв передан администратору.",
-        "menu_updated": "🔄 Мею обновлено.",
+        "menu_updated": "🔄 Меню обновлено.",
         "prof_title":   "👤 <b>Ваш профиль</b>",
         "prof_reqs":    "Всего запросов:",
         "prof_last":    "Последний запрос:",
@@ -442,8 +442,9 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор Google Finance с жесткой рыночной фильтрацией (устранение бага 22700)."""
-    url = "https://www.google.com/finance/quote/KRW-RUB"
+    """Разбор Google Finance с жесткой рыночной фильтрацией и защитой от кэширования Cloudflare."""
+    # ИСПРАВЛЕНИЕ: Добавлен уникальный секундный таймстамп-деструктор, чтобы пробивать HTML-кэш провайдера
+    url = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_ts={int(time.time())}"
     raw_price: Optional[float] = None
 
     try:
@@ -451,7 +452,6 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
-        # ИСПРАВЛЕНИЕ: Сужаем допустимые границы рынка до строгого диапазона воны (0.03 < v < 0.15)
         m = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+)\s*,', html)
         if m:
             v = float(m.group(1))
@@ -461,7 +461,7 @@ def _refresh_krw_google() -> Optional[float]:
         if raw_price is None:
             m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.]+)["\']', html)
             if not m:
-                m = re.search(r'data-last-price=["\']([0-9.]+)["\'][^>]*?data-id=["\']KRWRUB["\']', html)
+                m = re.search(r'data-last-price=["\']([0-9.]+)["\']', html)
             if m:
                 v = float(m.group(1))
                 if 0.03 < v < 0.15:
@@ -486,8 +486,6 @@ def _refresh_krw_google() -> Optional[float]:
                 v = float(m.group(1))
                 if 0.03 < v < 0.15:
                     raw_price = v
-
-        # Опасный широкий паттерн №5 полностью удален, так как он ошибочно цеплял мусорные значения 0.0227
 
         if raw_price is not None:
             result = 1_000_000 * raw_price
@@ -521,7 +519,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
         return value
 
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/KRW", timeout=8, headers=headers)
+        r = requests.get(f"https://open.er-api.com/v6/latest/KRW?_ts={int(time.time())}", timeout=8, headers=headers)
         if r.status_code == 200:
             rub = r.json().get("rates", {}).get("RUB")
             if rub and float(rub) > 0:
@@ -535,7 +533,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
     ]
     for url in fawaz_urls:
         try:
-            r = requests.get(url, timeout=8, headers=headers)
+            r = requests.get(f"{url}?_ts={int(time.time())}", timeout=8, headers=headers)
             if r.status_code == 200:
                 rub = r.json().get("krw", {}).get("rub")
                 if rub and float(rub) > 0:
@@ -661,7 +659,8 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        fg = pool.submit(_fetch_krw_rub_google)
+        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую, чтобы обновлять курс с каждым кликом пользователя
+        fg = pool.submit(_refresh_krw_google)
         fa = pool.submit(_fetch_abcex)
 
         upbit      = _safe_future(fu)
@@ -730,7 +729,6 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
-    # ИСПРАВЛЕНИЕ: Добавлены скобки (0-1%) строго напротив курсов ABCEX
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -767,7 +765,7 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
 
     part_krw     = f"{fmt_num(usdt_krw, 0)} ₩"        if usdt_krw   is not None else "— ₩"
     part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"         if usdt_rub   is not None else "— ₽"
-    part_krw_rub = f"{int(round(krw_google)):,} ₽"     if krw_google is not None else "— ₽"
+    part_krw_rub = f"{fmt_num(krw_google, 0)} ₽"       if krw_google is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
 
