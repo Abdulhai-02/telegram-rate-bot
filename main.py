@@ -445,27 +445,27 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 def _refresh_krw_google() -> Optional[float]:
     """
-    Высокоуровневый разбор нативного встроенного JSON-компонента Google Finance.
-    Обходит капчу за счет чтения сырого скрипта разметки.
+    Разбор нативного встроенного JSON-компонента Google Finance.
+    Исправлен синтаксис регулярных выражений для полной стабильности под Python 3.13+.
     """
     url = "https://www.google.com/finance/quote/KRW-RUB"
     try:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         
-        # Обновленный под май 2026 паттерн поиска котировок в разметке Google Finance
+        # Безопасный поиск атрибута цены
         match = re.search(r'data-last-price="([\d.]+)"', r.text)
         if not match:
             match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
         if not match:
-            # Третий слой защиты: парсинг из JS-блока window.DATA_RESPONSE
-            js_match = re.search(r'KRW-RUB[^]*?([\d.]+)', r.text)
+            # Исправленная безопасная структура поиска в JS блоках без недопустимого [^]
+            js_match = re.search(r'KRW-RUB.*?([\d.]+)', r.text, re.DOTALL)
             if js_match:
                 match = js_match
             
         if match:
             price = float(match.group(1))
-            if 0.001 < price < 10.0:  # Валидация разумных границ котировки воны к рублю
+            if 0.001 < price < 10.0:  # Валидация разумных границ
                 result = 1_000_000 * price
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
