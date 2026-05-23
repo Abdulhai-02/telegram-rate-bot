@@ -431,90 +431,96 @@ _krw_google_lock  = threading.Lock()
 def _fetch_krw_rub_google() -> Optional[float]:
     """
     Справочный курс KRW→RUB.
-    Сначала возвращает кэш (мгновенно), фоновый поток обновляет
-    его каждые 5 мин. При первом запросе делает запрос сразу.
+    Возвращает текущее закэшированное значение фиатного курса.
     """
     with _krw_google_lock:
         cached = _krw_google_cache["value"]
     if cached is not None:
         return cached
-    # Первый запрос — берём напрямую
     return _refresh_krw_google()
 
 
 def _refresh_krw_google() -> Optional[float]:
     """
-    Парсит живой курс KRW/RUB прямо со страницы (имитация браузера).
-    Обновляет кэш.
+    Парсит живой курс 1 000 000 KRW в RUB напрямую из поисковой страницы Google.
+    Имитирует поведение смартфона на iOS/Chrome, чтобы выдавать точные данные.
     """
-    # Используем XE.com или аналогичный живой ресурс
-    url = "https://www.xe.com/currencyconverter/convert/?Amount=1000000&From=KRW&To=RUB"
-    
+    url = "https://www.google.com/search?q=1000000+krw+to+rub&hl=ru"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
     }
 
     try:
+        # Используем отдельный запрос с мобильными хедерами
         r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         
-        # Ищем паттерн цены в тексте
-        match = re.search(r'(\d[0-9\s,.]*)\s?Russian Rubles', r.text)
-        
+        # Точный парсинг JSON-виджета калькулятора валют Google (data-value)
+        match = re.search(r'data-value="([\d.]+)"[^>]*data-name="Российский рубль"', r.text)
+        if not match:
+            match = re.search(r'data-value="([\d.]+)"', r.text)
+            
+        # Запасной вариант парсинга текстовой строки виджета конвертации
+        if not match:
+            match = re.search(r'(\d[\d\s\xa0]*[,.]?\d*)\s*(?:Российск[а-я]* рубл[а-я]*|RUB|руб)', r.text, re.IGNORECASE)
+
         if match:
-            raw_val = match.group(1).replace(",", "").replace(" ", "")
+            raw_val = match.group(1).replace('\xa0', '').replace(' ', '').replace(',', '.')
             result = float(raw_val)
             
+            # Если распарсилось единичное значение валюты, умножаем на миллион
+            if result < 1000:
+                result = result * 1000000
+                
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
             
-            logger.info("Парсинг XE.com успешен: %.2f", result)
+            logger.info("Прямой парсинг Google Search успешен: %.2f", result)
             return result
         else:
-            logger.warning("Не удалось найти цифру курса на странице XE")
+            logger.warning("Не удалось извлечь курс из HTML-кода Google")
             
     except Exception as exc:
-        logger.error("Ошибка парсинга страницы: %s", exc)
+        logger.error("Ошибка парсинга Google Search: %s", exc)
     
-    # Если парсинг не удался, пробуем старый API как резерв
+    # Высокоуровневый отказоустойчивый резерв (Yahoo Finance API) на случай капчи
     return _refresh_krw_google_fallback()
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Резервный метод через API, если парсинг страницы не сработал."""
-    for url in (
-        "https://open.er-api.com/v6/latest/RUB",
-        "https://v6.exchangerate-api.com/v6/latest/RUB",
-    ):
-        try:
-            r = requests.get(url, timeout=7)
-            r.raise_for_status()
-            krw = r.json()["rates"].get("KRW")
-            if krw and float(krw) > 0:
-                result = 1_000_000 / float(krw)
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("Google KRW/RUB (fallback) обновлён: %.2f", result)
-                return result
-        except Exception as exc:
-            logger.warning("_refresh_krw_google_fallback [%s]: %s", url, exc)
-            continue
+    """Резервный метод через стабильный API Yahoo Chart, если Google выдал капчу."""
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/KRWRUB=X"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if price:
+            result = 1_000_000 * float(price)
+            with _krw_google_lock:
+                _krw_google_cache["value"]   = result
+                _krw_google_cache["updated"] = now_msk()
+            logger.info("Резерв Yahoo Finance успешно сработал: %.2f", result)
+            return result
+    except Exception as exc:
+        logger.error("Критический сбой резервного API Yahoo: %s", exc)
     return None
 
 
 def _krw_google_updater() -> None:
     """
-    Фоновый поток: обновляет Google-курс каждые 5 минут.
-    Запускается при старте бота. Не зависит от запросов пользователей.
+    Фоновый поток: превентивно обновляет кэш курса каждые 5 минут.
     """
     logger.info("🔄 krw_google_updater: запущен (каждые 5 мин)")
-    # Первое обновление сразу при старте
     _refresh_krw_google()
     while True:
-        time.sleep(5 * 60)   # 5 минут
+        time.sleep(5 * 60)
         try:
             _refresh_krw_google()
         except Exception as exc:
@@ -522,18 +528,28 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    try:
-        r = _get_session().get(
-            "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
-            "?instrumentCode=USDTRUB",
-            timeout=_API_TIMEOUT,
-        )
-        r.raise_for_status()
-        d = r.json()
-        return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
-    except Exception as exc:
-        logger.warning("ABCEX: %s", exc)
-        return None, None
+    """
+    Получение актуального стакана USDTRUB с ABCEX.
+    Обновлено под современную структуру API стакана для ликвидации ошибок None.
+    """
+    urls = [
+        "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
+        "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
+        "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB"
+    ]
+    for url in urls:
+        try:
+            r = _get_session().get(url, timeout=_API_TIMEOUT)
+            if r.status_code == 200:
+                d = r.json()
+                if "bid" in d and "ask" in d and d["bid"] and d["ask"]:
+                    return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
+                elif "bids" in d and "asks" in d and d["bids"] and d["asks"]:
+                    return float(d["bids"][0][0]), float(d["asks"][0][0])
+        except Exception as exc:
+            logger.warning("ABCEX эндпоинт [%s] недоступен: %s", url, exc)
+            continue
+    return None, None
 
 
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
@@ -554,14 +570,16 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        fg = pool.submit(_fetch_krw_rub_google)
+        fg = pool.submit(_refresh_krw_google) # Принудительное «живое» обновление из Google Search
         fa = pool.submit(_fetch_abcex)
+        
         upbit      = _safe_future(fu)
         bithumb    = _safe_future(fb)
         krw_google = _safe_future(fg)
         abcex      = _safe_future(fa, default=(None, None))
+        
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    # KRW→RUB кросс через USDT (среднее bid/ask) - 0.6%
+    
     usdt_rub_mid = None
     if ab_buy is not None and ab_sell is not None:
         usdt_rub_mid = (ab_buy + ab_sell) / 2
@@ -569,12 +587,13 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         usdt_rub_mid = ab_buy
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
+        
     krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994 if (upbit and upbit > 0 and usdt_rub_mid) else None
     return {
         "upbit":      upbit,
         "bithumb":    bithumb,
         "krw_rub":    krw_rub,     # кросс USDT - 0.6% (основной)
-        "krw_google": krw_google,  # open.er-api (справочный, в скобках)
+        "krw_google": krw_google,  # живой курс из Google Search
         "ab_buy":     ab_buy,      # сырые данные ABCEX
         "ab_sell":    ab_sell,
     }
@@ -588,7 +607,7 @@ def fetch_auto_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fa = pool.submit(_fetch_abcex)
-        fg = pool.submit(_fetch_krw_rub_google)
+        fg = pool.submit(_refresh_krw_google) # Авторассылка также запрашивает свежий Google
         upbit      = _safe_future(fu)
         abcex      = _safe_future(fa, default=(None, None))
         krw_google = _safe_future(fg)
@@ -609,7 +628,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     # 🟢 Покупка: ab_buy  * 0.994  (Google в скобках)
     # 🔴 Продажа: ab_sell * 0.994  (Google в скобках)
     krw_main   = rates.get("krw_rub")    # кросс mid -0.6% (из fetch)
-    krw_google = rates.get("krw_google") # Google (open.er-api)
+    krw_google = rates.get("krw_google") # Google
 
     # ab_buy/sell → KRW/RUB через кросс с вычетом 0.6%
     upbit = rates.get("upbit")
@@ -742,6 +761,10 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
+    # Сброс локального ОЗУ кэша перед запросом, чтобы принудительно вытянуть свежий курс прямо с веб-страницы Google Search
+    with _krw_google_lock:
+        _krw_google_cache["value"] = None
+
     # 3. Запрашиваем курсы
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
@@ -853,7 +876,7 @@ def msg_auto_menu(m: types.Message) -> None:
         kb.row(types.InlineKeyboardButton("🚫 Выключить", callback_data="auto_0"))
     bot.send_message(m.chat.id, T["auto_menu"], reply_markup=main_keyboard(uid))
     bot.send_message(m.chat.id, T["auto_choose"], reply_markup=kb)
-    log_action(m.from_user, "Меню авто")
+    log_action(m.from_user, "Menu auto")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
