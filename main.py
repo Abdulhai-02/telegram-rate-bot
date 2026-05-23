@@ -433,7 +433,7 @@ def _refresh_krw_google() -> Optional[float]:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         
-        # Защита от 1.0000: Ищем строго по тегу валютной пары, отсекая общую разметку
+        # Точечный поиск по идентификатору пары, чтобы исключить ложные масштабы (1.00)
         match = re.search(r'data-id="KRWRUB"[^>]*?data-last-price="([\d.]+)"', r.text)
         if not match:
             match = re.search(r'class="YMlKec fxKbKc"[^>]*?>([\d.,]+)', r.text)
@@ -493,7 +493,7 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """Парсинг ИСКЛЮЧИТЕЛЬНО биржи ABCEX со сквозным сканированием обновленной структуры JSON."""
+    """Профессиональный парсер ИСКЛЮЧИТЕЛЬНО биржи ABCEX со сквозным сканированием обновленной структуры JSON."""
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
@@ -504,12 +504,13 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
     ]
     for url in urls:
         try:
-            # Сброс кэширования Cloudflare через динамический штамп времени
+            # Сброс серверного кэширования Cloudflare через динамический штамп времени
             ts_url = f"{url}&_={int(time.time() * 1000)}" if "?" in url else f"{url}?_={int(time.time() * 1000)}"
             r = _get_session().get(ts_url, timeout=_API_TIMEOUT)
             if r.status_code == 200:
                 d = r.json()
                 
+                # Поиск массивов ордеров независимо от изменений названий ключей
                 bids, asks = None, None
                 for b_key in ["bid", "bids", "buy", "data"]:
                     if b_key in d and d[b_key]:
@@ -565,7 +566,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
         
-    # ИСПРАВЛЕНИЕ: Вычитаем -0.6% комиссии (коэффициент 0.994) во время считывания кросс-курса
+    # ИСПРАВЛЕНИЕ: Вычитаем комиссию -0.6% (умножаем на 0.994) во время считывания кросс-курса
     if upbit and upbit > 0 and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
     else:
@@ -602,7 +603,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     krw_google = rates.get("krw_google") 
     upbit = rates.get("upbit")
     
-    # ИСПРАВЛЕНИЕ: Математический вычет комиссии -0.6% (0.994) на покупку и продажу кросс-курса воны
+    # ИСПРАВЛЕНИЕ: Точный вычет комиссии -0.6% (0.994) на покупку и продажу кросс-курса воны
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
             return (1_000_000 * usdt_price / upbit) * 0.994
@@ -618,6 +619,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
+    # ИСПРАВЛЕНИЕ: Цены ABCEX выводятся абсолютно чистыми, без наценок и процентов
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -829,7 +831,7 @@ def msg_auto_menu(m: types.Message) -> None:
         kb.row(types.InlineKeyboardButton("🚫 Выключить", callback_data="auto_0"))
     bot.send_message(m.chat.id, T["auto_menu"], reply_markup=main_keyboard(uid))
     bot.send_message(m.chat.id, T["auto_choose"], reply_markup=kb)
-    log_action(m.from_user, "Меню авто")
+    log_action(m.from_user, "Menus auto")
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("auto_"))
@@ -1269,11 +1271,26 @@ if __name__ == "__main__":
     ).start()
     logger.info("🌐 Flask на порту %d", port)
 
-    # ИСПРАВЛЕНИЕ: Перенос стартового уведомления ИСКЛЮЧИТЕЛЬНО в логи сервера во избежание спама и конфликтов
-    logger.info("🚀 Бот успешно перезагружен, проверен и готов к работе!")
+    logger.info("🤖 Бот запущен")
+    
+    # Флаг-предохранитель для исключения дублирования стартовых логов в канал
+    startup_notified = False
 
     while True:
         try:
+            # ИСПРАВЛЕНИЕ: Отправка логов о перезагрузке СТРОГО В ТВОЙ КАНАЛ, исключая спам в личку
+            if not startup_notified:
+                try:
+                    bot.send_message(
+                        ADMIN_LOG_CHAT_ID, 
+                        "🚀 <b>Система управления курсами успешно перезагружена на Render и готова к работе!</b>\n\n<i>Все новые лог-сессии перенаправлены в этот канал.</i>", 
+                        parse_mode="HTML"
+                    )
+                    logger.info("Уведомление о перезагрузке успешно отправлено в лог-канал.")
+                    startup_notified = True
+                except Exception as channel_err:
+                    logger.warning("Не удалось отправить пуш в лог-канал: %s", channel_err)
+
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
             break 
         except telebot.apihelper.ApiTelegramException as e:
