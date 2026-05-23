@@ -180,6 +180,7 @@ def _parse_iso(raw: Optional[str]) -> Optional[datetime]:
 
 
 def _elapsed_sec(dt: Optional[datetime]) -> float:
+    """Секунд прошло с dt. Корректно для naive и aware datetime."""
     if dt is None:
         return float("inf")
     try:
@@ -193,6 +194,7 @@ def _elapsed_sec(dt: Optional[datetime]) -> float:
 #  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════════════════
 def load_db() -> None:
+    """Загружает все профили и подписки из MongoDB в RAM при старте."""
     if users_col is None or auto_col is None:
         logger.warning("load_db: MongoDB недоступна, пропускаем")
         return
@@ -1229,7 +1231,6 @@ def ping_endpoint() -> Any:
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        # Сброс вебхука и полная очистка скопившихся апдейтов в пуле тг
         bot.delete_webhook(drop_pending_updates=True)
         time.sleep(2)
         bot.remove_webhook()
@@ -1253,6 +1254,25 @@ if __name__ == "__main__":
 
     logger.info("🤖 Бот запущен")
     
-    # Решение конфликта 409: встроенный infinity_polling сам управляет реконнектами.
-    # Убран внешний цикл while True, мешавший Render корректно гасить старый инстанс.
-    bot.infinity_polling(skip_pending=True)
+    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта
+    while True:
+        try:
+            # Отправка стартового пуш-сообщения администратору
+            try:
+                bot.send_message(MY_ADMIN_ID, "🚀 <b>Бот успешно перезагружен и готов к работе!</b>", parse_mode="HTML")
+                logger.info("Стартовое уведомление отправлено администратору")
+            except Exception as admin_err:
+                logger.warning("Не удалось отправить пуш администратору: %s", admin_err)
+                
+            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
+            break # Если пуллинг завершился штатно — выходим из цикла
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 409:
+                logger.warning("Обнаружен перехват токена старым контейнером Render (Ошибка 409). Ожидание завершения... Повтор через 5 секунд.")
+                time.sleep(5)
+            else:
+                logger.error("Критический сбой Telegram API: %s — Перезапуск через 10 секунд.", e)
+                time.sleep(10)
+        except Exception as exc:
+            logger.error("Непредвиденный сбой пуллинга: %s — Перезапуск через 10 секунд.", exc)
+            time.sleep(10)
