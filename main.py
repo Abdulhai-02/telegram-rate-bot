@@ -4,6 +4,7 @@ import threading
 import time
 import concurrent.futures
 import re
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple, Dict, Any
 
@@ -11,7 +12,7 @@ import requests
 from dotenv import load_dotenv
 import telebot
 from telebot import types
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, abort
 from pymongo import MongoClient
 import certifi
 
@@ -36,7 +37,22 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
+# RENDER_URL — публичный URL вашего сервиса на Render, например:
+#   https://my-p2p-bot.onrender.com
+# Используется и для anti-sleep self-ping, и для регистрации webhook.
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
+
+# Опциональные ENV для ABCEX (см. диагностику в логах)
+ABCEX_API_KEY:    str = os.getenv("ABCEX_API_KEY", "").strip()
+ABCEX_API_SECRET: str = os.getenv("ABCEX_API_SECRET", "").strip()
+ABCEX_PROXY:      str = os.getenv("ABCEX_PROXY", "").strip()
+
+# Секретный токен для проверки запросов от Telegram (X-Telegram-Bot-Api-Secret-Token).
+# Если не задан в окружении — генерируется один раз при старте.
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip() or secrets.token_urlsafe(32)
+
+# Путь webhook — содержит токен бота, чтобы посторонние не могли долбить URL.
+WEBHOOK_PATH: str = f"/webhook/{TELEGRAM_TOKEN}"
 
 _API_TIMEOUT  = 8
 _API_MAX_WAIT = 12
@@ -44,6 +60,11 @@ _API_MAX_WAIT = 12
 _DATA_LOCK = threading.Lock()
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN, parse_mode="HTML", threaded=True)
+
+if ABCEX_API_KEY:
+    logger.info("✅ ABCEX_API_KEY обнаружен (длина=%d)", len(ABCEX_API_KEY))
+if ABCEX_PROXY:
+    logger.info("✅ ABCEX_PROXY задан (через %s)", ABCEX_PROXY.split("@")[-1])
 
 # ═══════════════════════════════════════════════════════════════════════
 #  MONGODB
@@ -394,7 +415,7 @@ def _fetch_bithumb() -> Optional[float]:
         data = r.json()
         if isinstance(data, list) and data:
             return float(data[0].get("trade_price", 0))
-    except:
+    except Exception:
         pass
     try:
         r = _get_session().get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=_API_TIMEOUT)
@@ -427,14 +448,12 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
-        # Паттерн 1: JSON-конфиг вида ["KRW","RUB",0.0XXXXX,...]
         m = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+)\s*,', html)
         if m:
             v = float(m.group(1))
             if 0.005 < v < 1.0:
                 raw_price = v
 
-        # Паттерн 2: data-last-price на теге пары KRWRUB
         if raw_price is None:
             m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.]+)["\']', html)
             if not m:
@@ -444,7 +463,6 @@ def _refresh_krw_google() -> Optional[float]:
                 if 0.005 < v < 1.0:
                     raw_price = v
 
-        # Паттерн 3: Класс YMlKec (числовые значения курса на странице)
         if raw_price is None:
             candidates = re.findall(r'class="YMlKec[^"]*"[^>]*>([\d,. ]+)<', html)
             for c in candidates:
@@ -456,7 +474,6 @@ def _refresh_krw_google() -> Optional[float]:
                 except ValueError:
                     continue
 
-        # Паттерн 4: Любой JSON-блок с числом в нужном диапазоне рядом с "KRW" и "RUB"
         if raw_price is None:
             m = re.search(r'"KRW"[^}]{0,80}"RUB"[^}]{0,80}(0\.\d{4,8})', html)
             if not m:
@@ -466,7 +483,6 @@ def _refresh_krw_google() -> Optional[float]:
                 if 0.005 < v < 1.0:
                     raw_price = v
 
-        # Паттерн 5: Широкий поиск числа 0.005–0.15 в HTML
         if raw_price is None:
             candidates = re.findall(r'\b(0\.0[0-9]{3,6})\b', html)
             for c in candidates:
@@ -493,60 +509,78 @@ def _refresh_krw_google() -> Optional[float]:
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Три резервных источника фиатного курса KRW/RUB без API-ключей."""
+    """
+    Резервные источники фиатного курса KRW/RUB. Все рабочие на ноябрь 2026.
+    Возвращает курс в формате «сколько ₽ за 1 000 000 ₩».
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+    }
 
-    # Источник 1: open.er-api (бесплатно, без ключа)
+    def _save(value: float, src: str) -> float:
+        with _krw_google_lock:
+            _krw_google_cache["value"]   = value
+            _krw_google_cache["updated"] = now_msk()
+        logger.info("[%s] KRW→RUB: %.2f", src, value)
+        return value
+
+    # Источник 1: open.er-api.com (бесплатно, без ключа, стабильный)
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/KRW", timeout=7)
+        r = requests.get("https://open.er-api.com/v6/latest/KRW", timeout=8, headers=headers)
         if r.status_code == 200:
-            data = r.json()
-            rub = data.get("rates", {}).get("RUB")
+            rub = r.json().get("rates", {}).get("RUB")
             if rub and float(rub) > 0:
-                result = 1_000_000 * float(rub)
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("[Fallback-1 open.er-api] KRW→RUB: %.2f", result)
-                return result
+                return _save(1_000_000 * float(rub), "Fallback-1 open.er-api")
+        else:
+            logger.warning("[Fallback-1] HTTP %d", r.status_code)
     except Exception as e:
-        logger.warning("[Fallback-1] open.er-api: %s", e)
+        logger.warning("[Fallback-1] %s", e)
 
-    # Источник 2: fawazahmed0 currency-api (GitHub CDN, бесплатно, без ключа)
+    # Источник 2: fawazahmed0 currency-api (актуальные пути)
+    fawaz_urls = [
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@1/v1/currencies/krw.json",
+        "https://currency-api.pages.dev/v1/currencies/krw.json",
+        "https://latest.currency-api.pages.dev/v1/currencies/krw.json",
+    ]
+    for url in fawaz_urls:
+        try:
+            r = requests.get(url, timeout=8, headers=headers)
+            if r.status_code == 200:
+                rub = r.json().get("krw", {}).get("rub")
+                if rub and float(rub) > 0:
+                    return _save(1_000_000 * float(rub), "Fallback-2 fawazahmed0")
+        except Exception as e:
+            logger.warning("[Fallback-2 %s] %s", url, e)
+
+    # Источник 3: Frankfurter (ЕЦБ, бесплатно, без ключа)
     try:
         r = requests.get(
-            "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/krw.json",
-            timeout=8
+            "https://api.frankfurter.dev/v1/latest?base=KRW&symbols=RUB",
+            timeout=8, headers=headers,
         )
         if r.status_code == 200:
-            rub = r.json().get("krw", {}).get("rub")
+            rub = r.json().get("rates", {}).get("RUB")
             if rub and float(rub) > 0:
-                result = 1_000_000 * float(rub)
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("[Fallback-2 fawazahmed0] KRW→RUB: %.2f", result)
-                return result
+                return _save(1_000_000 * float(rub), "Fallback-3 frankfurter")
     except Exception as e:
-        logger.warning("[Fallback-2] fawazahmed0: %s", e)
+        logger.warning("[Fallback-3] %s", e)
 
-    # Источник 3: exchangerate.host (крайний вариант)
+    # Источник 4: ЦБ РФ (последний шанс)
     try:
-        r = requests.get(
-            "https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000",
-            timeout=8
-        )
+        r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8, headers=headers)
         if r.status_code == 200:
-            result = float(r.json()["result"])
-            if result > 0:
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("[Fallback-3 exchangerate.host] KRW→RUB: %.2f", result)
-                return result
+            krw = r.json().get("Valute", {}).get("KRW")
+            if krw and float(krw.get("Value", 0)) > 0 and int(krw.get("Nominal", 1)) > 0:
+                per_one_krw = float(krw["Value"]) / float(krw["Nominal"])
+                return _save(1_000_000 * per_one_krw, "Fallback-4 ЦБ РФ")
     except Exception as e:
-        logger.warning("[Fallback-3] exchangerate.host: %s", e)
+        logger.warning("[Fallback-4] %s", e)
 
-    logger.error("[Fallback] Все три источника недоступны, курс Google не получен")
+    logger.error("[Fallback] Все источники недоступны — Google курс не получен")
     return None
 
 
@@ -561,8 +595,12 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """Парсинг стакана ABCEX с поддержкой всех известных форматов ответа."""
-
+    """
+    Парсинг стакана ABCEX. Поддерживает:
+      • опциональный API-ключ (header X-API-KEY / Authorization Bearer)
+      • опциональный прокси (ABCEX_PROXY env) — нужен при гео-блоке Cloudflare
+      • детальный лог тела ответа при ошибке
+    """
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
@@ -573,8 +611,14 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         "https://api.abcex.io/api/v2/depth?symbol=usdtrub",
     ]
 
+    auth_headers: Dict[str, str] = {}
+    if ABCEX_API_KEY:
+        auth_headers["X-API-KEY"]   = ABCEX_API_KEY
+        auth_headers["Authorization"] = f"Bearer {ABCEX_API_KEY}"
+
+    proxies = {"http": ABCEX_PROXY, "https": ABCEX_PROXY} if ABCEX_PROXY else None
+
     def _extract_price(entry) -> Optional[float]:
-        """Извлекает цену из элемента стакана любого формата."""
         if entry is None:
             return None
         if isinstance(entry, dict):
@@ -598,10 +642,8 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         return None
 
     def _extract_side(data: dict, bid_keys, ask_keys):
-        """Извлекает bids и asks, проверяя верхний уровень и вложенный data."""
         bids, asks = None, None
         nested = data.get("data") if isinstance(data.get("data"), dict) else None
-
         for b_key in bid_keys:
             src = nested if nested and b_key in nested else data
             val = src.get(b_key)
@@ -614,7 +656,6 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
             if val and isinstance(val, (list, tuple)) and len(val) > 0:
                 asks = val
                 break
-
         return bids, asks
 
     BID_KEYS = ["bid", "bids", "buy", "buys", "Bids", "BID"]
@@ -623,47 +664,70 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
     for url in urls:
         try:
             cache_bust = f"{'&' if '?' in url else '?'}_={int(time.time() * 1000)}"
-            r = _get_session().get(url + cache_bust, timeout=_API_TIMEOUT)
+            r = _get_session().get(
+                url + cache_bust,
+                timeout=_API_TIMEOUT,
+                headers=auth_headers if auth_headers else None,
+                proxies=proxies,
+            )
+            body_preview = r.text[:300].replace("\n", " ")
 
             if r.status_code != 200:
-                logger.warning("[ABCEX] HTTP %d → %s", r.status_code, url)
+                logger.warning(
+                    "[ABCEX] HTTP %d %s | body: %s",
+                    r.status_code,
+                    url.split("?")[0].rsplit("/", 1)[-1],
+                    body_preview,
+                )
                 continue
 
-            d = r.json()
+            try:
+                d = r.json()
+            except ValueError:
+                logger.warning("[ABCEX] Невалидный JSON: %s | body: %s", url, body_preview)
+                continue
 
             if isinstance(d, list):
                 logger.warning("[ABCEX] Ответ — список, а не dict: %s", url)
                 continue
 
             bids, asks = _extract_side(d, BID_KEYS, ASK_KEYS)
-
             if not bids or not asks:
-                logger.warning("[ABCEX] Стакан пуст или ключи не найдены: %s | keys=%s",
-                               url, list(d.keys()))
+                logger.warning(
+                    "[ABCEX] Стакан пуст / нет ключей: %s | keys=%s | body: %s",
+                    url, list(d.keys()), body_preview,
+                )
                 continue
 
             b_price = _extract_price(bids[0])
             a_price = _extract_price(asks[0])
 
             if b_price and a_price and b_price > 0 and a_price > 0:
-                logger.info("[ABCEX] Успех: bid=%.2f ask=%.2f ← %s", b_price, a_price, url)
+                logger.info("[ABCEX] ✅ bid=%.2f ask=%.2f ← %s", b_price, a_price, url)
                 return float(b_price), float(a_price)
             else:
-                logger.warning("[ABCEX] Не удалось извлечь цену из элемента: bid=%s ask=%s",
-                               bids[0], asks[0])
+                logger.warning("[ABCEX] Цена не извлечена: bid=%s ask=%s", bids[0], asks[0])
 
+        except requests.exceptions.ProxyError as e:
+            logger.error("[ABCEX] Прокси недоступен: %s", e)
+            continue
         except Exception as e:
-            logger.error("[ABCEX] Ошибка (%s): %s", url, e)
+            logger.error("[ABCEX] Ошибка %s: %s", url, e)
             continue
 
-    logger.critical("[ABCEX] Все эндпоинты недоступны или вернули некорректный стакан")
+    logger.critical(
+        "[ABCEX] Все эндпоинты недоступны — диагностика:\n"
+        "  • везде HTTP 403/503 → гео-блок Cloudflare → задайте ABCEX_PROXY\n"
+        "  • HTTP 401          → задайте ABCEX_API_KEY\n"
+        "  • HTTP 200 + пустой → формат ответа изменился"
+    )
     return None, None
 
 
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
     try:
         return future.result(timeout=_API_MAX_WAIT)
-    except:
+    except Exception:
         return default
 
 
@@ -783,7 +847,6 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 #  ОБРАБОТЧИКИ TELEGRAM
 # ═══════════════════════════════════════════════════════════════════════
-
 @bot.message_handler(commands=["start"])
 def cmd_start(m: types.Message) -> None:
     init_user(m.from_user)
@@ -1161,7 +1224,7 @@ def cb_admin(c: types.CallbackQuery) -> None:
                 logger.error("Тихая подписка %d: %s", uid, exc)
         bot.edit_message_text(
             f"✅ Подписка {hours}H для <b>{count}</b> чел.",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML,",
+            c.message.chat.id, c.message.message_id, parse_mode="HTML",
         )
         log_action(c.from_user, f"Массовая подписка {hours}H", result=f"{count} чел.")
 
@@ -1303,39 +1366,130 @@ def _auto_worker() -> None:
 #  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
+    """
+    В webhook-режиме входящий HTTP-трафик от Telegram сам по себе не даёт
+    Render усыпить контейнер при активных пользователях. Но если бот стоит
+    без действий 15+ минут, Render всё равно усыпит сервис. Само-пинг по
+    /ping каждые 10 минут это лечит.
+    """
     _INTERVAL   = 10 * 60
     _PING_AGENT = requests.Session()
     _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
 
-    _EXTERNAL_URLS = [
-        "https://httpbin.org/get",
-        "https://api.upbit.com/v1/market/all",
-    ]
-
-    def _ping_all() -> None:
-        if RENDER_URL:
-            try:
-                r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
-                logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
-            except Exception as exc:
-                logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
-        for url in _EXTERNAL_URLS:
-            try:
-                _PING_AGENT.get(url, timeout=10)
-            except Exception:
-                pass
+    def _ping_self() -> None:
+        if not RENDER_URL:
+            return
+        try:
+            r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
+            logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
+        except Exception as exc:
+            logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
 
     logger.info("🏓 anti_sleep: запущен (интервал %d мин)", _INTERVAL // 60)
-    time.sleep(5)
-    _ping_all()
+    time.sleep(15)
+    _ping_self()
 
     while True:
         try:
             time.sleep(_INTERVAL)
-            _ping_all()
+            _ping_self()
         except Exception as exc:
             logger.error("anti_sleep_worker error: %s", exc)
             time.sleep(60)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ЗАХВАТ ТОКЕНА У СТАРОГО КОНТЕЙНЕРА
+# ═══════════════════════════════════════════════════════════════════════
+def _force_takeover_token() -> None:
+    """
+    Гарантированно отбирает токен у старого контейнера Render перед стартом.
+
+    Шаги:
+      1. deleteWebhook?drop_pending_updates=true — снимает webhook И ломает
+         long-polling у любого старого инстанса (если тот делал getUpdates).
+      2. 3 коротких getUpdates с offset=-1, timeout=0 — выталкивают любого,
+         кто продолжает polling, и подтверждают, что токен наш.
+      3. Пауза между попытками, чтобы старый процесс успел упасть.
+
+    После takeover в `main` будет вызван setWebhook на новый URL —
+    с этого момента старый контейнер физически не может получать апдейты.
+    """
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+    try:
+        r = requests.post(
+            f"{base_url}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=10,
+        )
+        logger.info("Takeover: deleteWebhook → HTTP %d | %s",
+                    r.status_code, r.text[:120])
+    except Exception as exc:
+        logger.warning("Takeover: deleteWebhook failed: %s", exc)
+
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(
+                f"{base_url}/getUpdates",
+                json={"offset": -1, "timeout": 0, "limit": 1},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                logger.info("Takeover [%d/3]: getUpdates OK — токен наш", attempt)
+            elif r.status_code == 409:
+                logger.warning("Takeover [%d/3]: 409 — старый контейнер жив, ждём", attempt)
+            else:
+                logger.warning("Takeover [%d/3]: HTTP %d | %s",
+                               attempt, r.status_code, r.text[:120])
+        except Exception as exc:
+            logger.warning("Takeover [%d/3]: %s", attempt, exc)
+        time.sleep(3)
+
+    logger.info("✅ Takeover завершён")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  УСТАНОВКА WEBHOOK
+# ═══════════════════════════════════════════════════════════════════════
+def _setup_webhook() -> bool:
+    """
+    Регистрирует webhook у Telegram. Возвращает True при успехе.
+
+    Если RENDER_URL не задан — возвращает False и предупреждает в лог.
+    В этом случае main() должен упасть на polling, чтобы хоть как-то работать
+    (например, при локальном запуске).
+    """
+    if not RENDER_URL:
+        logger.warning("⚠️ RENDER_URL не задан — webhook невозможен, fallback на polling")
+        return False
+
+    webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
+
+    try:
+        result = bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+            allowed_updates=["message", "callback_query"],
+            max_connections=40,
+        )
+        if result:
+            logger.info("✅ Webhook зарегистрирован: %s", webhook_url)
+            try:
+                info = bot.get_webhook_info()
+                logger.info("ℹ️  Webhook info: url=%s pending=%d last_error=%s",
+                            info.url, info.pending_update_count or 0,
+                            info.last_error_message or "—")
+            except Exception:
+                pass
+            return True
+        else:
+            logger.error("❌ set_webhook вернул False")
+            return False
+    except Exception as exc:
+        logger.error("❌ set_webhook исключение: %s", exc)
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1351,6 +1505,7 @@ def health() -> Any:
         n_s = len(AUTO_USERS)
     return jsonify({
         "status": "ok",
+        "mode":   "webhook" if RENDER_URL else "polling",
         "users":  n_u,
         "subs":   n_s,
         "time":   now_msk().strftime("%Y-%m-%d %H:%M:%S MSK"),
@@ -1362,57 +1517,123 @@ def ping_endpoint() -> Any:
     return jsonify({"pong": True, "time": now_msk().isoformat()}), 200
 
 
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook() -> Any:
+    """
+    Эндпоинт, на который Telegram отправляет апдейты.
+
+    Защита:
+      • URL содержит токен бота — посторонние его не знают.
+      • Header `X-Telegram-Bot-Api-Secret-Token` — должен совпадать с
+        WEBHOOK_SECRET, который мы передали в set_webhook.
+      • Content-Type должен быть application/json.
+
+    Telegram ожидает ответ HTTP 200 в течение нескольких секунд, иначе
+    повторит апдейт. Поэтому реальная обработка апдейта запускается в
+    отдельном потоке, а мы сразу возвращаем 200.
+    """
+    # 1. Проверка секрета
+    received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not secrets.compare_digest(received_secret, WEBHOOK_SECRET):
+        logger.warning("Webhook: неверный secret token (источник: %s)",
+                       request.remote_addr)
+        abort(403)
+
+    # 2. Проверка Content-Type
+    if request.headers.get("Content-Type", "").split(";")[0] != "application/json":
+        abort(400)
+
+    # 3. Парсинг апдейта
+    try:
+        raw = request.get_data(as_text=True)
+        update = telebot.types.Update.de_json(raw)
+        if update is None:
+            abort(400)
+    except Exception as exc:
+        logger.error("Webhook: ошибка парсинга апдейта: %s", exc)
+        abort(400)
+
+    # 4. Обработка в отдельном потоке (чтобы быстро вернуть 200)
+    threading.Thread(
+        target=lambda: bot.process_new_updates([update]),
+        daemon=True,
+    ).start()
+
+    return "", 200
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+def _notify_startup() -> None:
     try:
-        bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(2)
-        bot.remove_webhook()
-        time.sleep(3)
-        logger.info("Успешный сброс сессий и очистка очереди обновлений")
+        bot.send_message(
+            ADMIN_LOG_CHAT_ID,
+            "🚀 <b>Система управления курсами успешно перезагружена на Render и готова к работе!</b>\n\n"
+            "<i>Все новые лог-сессии перенаправлены в этот канал.</i>",
+            parse_mode="HTML",
+        )
+        logger.info("Уведомление о перезагрузке отправлено в лог-канал")
     except Exception as exc:
-        logger.warning("Ошибка при очистке вехука: %s", exc)
+        logger.warning("Не удалось отправить пуш в лог-канал: %s", exc)
 
-    load_db()
 
-    threading.Thread(target=_auto_worker,        daemon=True, name="auto_worker").start()
-    threading.Thread(target=_anti_sleep_worker,  daemon=True, name="anti_sleep").start()
-    threading.Thread(target=_krw_google_updater, daemon=True, name="krw_google").start()
-
-    port = int(os.environ.get("PORT", 10_000))
-    threading.Thread(
-        target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False),
-        daemon=True, name="flask",
-    ).start()
-    logger.info("🌐 Flask на порту %d", port)
-
-    startup_notified = False
-
+def _polling_fallback() -> None:
+    """Используется только если RENDER_URL не задан (локальная отладка)."""
+    logger.warning("⚠️ Запуск в режиме polling (только для локальной отладки)")
     while True:
         try:
-            if not startup_notified:
-                try:
-                    bot.send_message(
-                        ADMIN_LOG_CHAT_ID,
-                        "🚀 <b>Система управления курсами успешно перезагружена на Render и готова к работе!</b>\n\n<i>Все новые лог-сессии перенаправлены в этот канал.</i>",
-                        parse_mode="HTML"
-                    )
-                    logger.info("Уведомление о перезагрузке успешно отправлено в лог-канал.")
-                    startup_notified = True
-                except Exception as channel_err:
-                    logger.warning("Не удалось отправить пуш в лог-канал: %s", channel_err)
-
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
             break
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 409:
-                logger.warning("Обнаружен перехват токена старым контейнером Render (Ошибка 409). Ожидание завершения... Повтор через 5 секунд.")
+                logger.warning("409 Conflict — ждём 5 сек и повторяем")
                 time.sleep(5)
             else:
-                logger.error("Критический сбой Telegram API: %s — Перезапуск через 10 секунд.", e)
+                logger.error("Telegram API error: %s — повтор через 10 сек", e)
                 time.sleep(10)
         except Exception as exc:
-            logger.error("Непредвиденный сбой пуллинга: %s — Перезапуск через 10 секунд.", exc)
+            logger.error("Polling crashed: %s — повтор через 10 сек", exc)
             time.sleep(10)
+
+
+if __name__ == "__main__":
+    # 1. Захват токена у старого контейнера
+    _force_takeover_token()
+
+    # 2. Загрузка БД
+    load_db()
+
+    # 3. Фоновые воркеры
+    threading.Thread(target=_auto_worker,        daemon=True, name="auto_worker").start()
+    threading.Thread(target=_anti_sleep_worker,  daemon=True, name="anti_sleep").start()
+    threading.Thread(target=_krw_google_updater, daemon=True, name="krw_google").start()
+
+    # 4. Регистрация webhook (или fallback на polling)
+    webhook_ok = _setup_webhook()
+
+    # 5. Уведомление в лог-канал
+    threading.Thread(target=_notify_startup, daemon=True).start()
+
+    # 6. Запуск
+    port = int(os.environ.get("PORT", 10_000))
+
+    if webhook_ok:
+        # Webhook-режим: Flask в главном потоке, polling не нужен
+        logger.info("🌐 Старт Flask в webhook-режиме на порту %d", port)
+        try:
+            # Для продакшна лучше gunicorn — но Flask dev server тоже работает.
+            # Если хотите gunicorn — измените Render Start Command на:
+            #   gunicorn --workers 1 --threads 8 --bind 0.0.0.0:$PORT main:flask_app
+            # и удалите блок ниже (Render будет сам стартовать flask_app).
+            flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False, threaded=True)
+        except Exception as exc:
+            logger.critical("Flask упал: %s", exc)
+    else:
+        # Polling-режим (для локальной отладки без RENDER_URL)
+        threading.Thread(
+            target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False),
+            daemon=True, name="flask",
+        ).start()
+        logger.info("🌐 Flask на порту %d (вспомогательный)", port)
+        _polling_fallback()
