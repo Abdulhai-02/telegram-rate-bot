@@ -391,7 +391,8 @@ def _get_session() -> requests.Session:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
+            "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908; SOCS=CAISHAgBEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNDA5LjA2X3AwGgVydS1SVSgB; AEC=AVYB7coM1X",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
@@ -412,7 +413,7 @@ def _fetch_upbit() -> Optional[float]:
 
 def _fetch_bithumb() -> Optional[float]:
     try:
-        r = _get_session().get("https://api.bithumb.com/v1/ticker?markets=KRW-USDT", timeout=_API_TIMEOUT)
+        r = _get_session().get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=_API_TIMEOUT)
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and data:
@@ -434,7 +435,6 @@ def _fetch_krw_rub_google() -> Optional[float]:
         cached = _krw_google_cache["value"]
         updated = _krw_google_cache["updated"]
     
-    # Защитный интервал в 10 минут: если кэш свежий — отдаем его без отправки сетевого запроса
     if cached is not None and updated is not None:
         if _elapsed_sec(updated) < 600:
             return cached
@@ -443,43 +443,113 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Профессиональный парсинг фиатного кросс-курса (схема RUB-KRW в обход Consent Wall)."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}
-    
-    # 🚀 План А: Институциональный фид Yahoo Finance (работает во Франкфурте без куки-заглушек)
-    try:
-        r = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/RUBKRW=X?interval=1m&range=1d", headers=headers, timeout=6)
-        if r.status_code == 200:
-            data = r.json()
-            v = float(data["chart"]["result"][0]["meta"]["regularMarketPrice"])
-            # Коридор валидации: сколько вон дают за 1 рубль (банит мусорные 0.0227)
-            if 10.0 < v < 25.0:
-                result = 1_000_000 / v
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("[Google/Finance] ✅ Живой курс успешно получен: %.2f ₽ (v=%.4f)", result, v)
-                return result
-    except Exception as e:
-        logger.debug("Ошибка фида Yahoo: %s", e)
+    """Разбор стабильной пары RUB-KRW из ядра скриптов с вычислением 1 000 000 / v."""
+    url = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&_ts={int(time.time())}"
+    raw_v: Optional[float] = None
 
-    # 🚀 План Б: Высокоскоростной шлюз open.er-api (прямой расчет по паре KRW/RUB)
     try:
-        r = requests.get("https://open.er-api.com/v6/latest/KRW", headers=headers, timeout=6)
-        if r.status_code == 200:
-            data = r.json()
-            rub_per_krw = data.get("rates", {}).get("RUB")
-            if rub_per_krw and rub_per_krw > 0:
-                result = 1_000_000 * float(rub_per_krw)
-                v = 1_000_000 / result if result > 0 else 0
+        r = _get_session().get(url, timeout=10)
+        r.raise_for_status()
+        html = r.text
+
+        # Паттерн 1: Извлечение данных из JSON-ядра скрипта Google Finance
+        m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
+        if m:
+            v_str = m.group(1).replace(',', '.')
+            try:
+                v = float(v_str)
                 if 10.0 < v < 25.0:
-                    with _krw_google_lock:
-                        _krw_google_cache["value"]   = result
-                        _krw_google_cache["updated"] = now_msk()
-                    logger.info("[Google/Finance] ✅ Живой курс успешно получен через резервный канал: %.2f ₽", result)
-                    return result
+                    raw_v = v
+            except ValueError:
+                pass
+
+        # Паттерн 2: Извлечение из европейских классов верстки fxKbKc / YMlKec во Франкфурте
+        if raw_v is None:
+            container_matches = re.findall(r'class="[^"]*(?:fxKbKc|YMlKec)[^"]*"[^>]*>([^<]+)<', html)
+            for c in container_matches:
+                clean_str = c.replace(',', '.').replace(' ', '').replace('\xa0', '').strip()
+                clean_str = re.sub(r'[^\d.]', '', clean_str)
+                if not clean_str:
+                    continue
+                try:
+                    v = float(clean_str)
+                    if 10.0 < v < 25.0:
+                        raw_v = v
+                        break
+                except ValueError:
+                    continue
+
+        if raw_v is None:
+            m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.,]+)["\']', html)
+            if not m:
+                m = re.search(r'data-last-price=["\']([0-9.,]+)["\'][^>]*?data-id=["\']KRWRUB["\']', html)
+            if m:
+                v = float(m.group(1).replace(',', '.'))
+                if 10.0 < v < 25.0:
+                    raw_v = v
+
+        if raw_v is not None:
+            # Твоя старая проверенная схема: миллион делим на значение RUB-KRW
+            result = 1_000_000 / raw_v
+            with _krw_google_lock:
+                _krw_google_cache["value"]   = result
+                _krw_google_cache["updated"] = now_msk()
+            logger.info("[Google/Finance] ✅ Схема RUB-KRW успешно выполнена: %.2f ₽ (v=%.4f)", result, raw_v)
+            return result
+        else:
+            logger.warning("[Google/Finance] Паттерн RUB-KRW отфильтровал некорректные границы рынка, запуск API Fallback")
+
+    except Exception as exc:
+        logger.error("[Google/Finance] Исключение при запросе: %s", exc)
+
+    return _refresh_krw_google_fallback()
+
+
+def _refresh_krw_google_fallback() -> Optional[float]:
+    """Резервные чистые фиатные шлюзы реального времени."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+
+    def _save(value: float, src: str) -> float:
+        with _krw_google_lock:
+            _krw_google_cache["value"]   = value
+            _krw_google_cache["updated"] = now_msk()
+        logger.info("[%s] KRW→RUB: %.2f", src, value)
+        return value
+
+    try:
+        r = requests.get(f"https://open.er-api.com/v6/latest/KRW?_ts={int(time.time())}", timeout=8, headers=headers)
+        if r.status_code == 200:
+            rub = r.json().get("rates", {}).get("RUB")
+            if rub and float(rub) > 0:
+                return _save(1_000_000 * float(rub), "Fallback-1 open.er-api")
     except Exception as e:
-        logger.error("[Google/Finance] ❌ Критическая ошибка фиатных шлюзов: %s", e)
+        logger.warning("[Fallback-1] %s", e)
+
+    fawaz_urls = [
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@1/v1/currencies/krw.json",
+        "https://currency-api.pages.dev/v1/currencies/krw.json",
+    ]
+    for url in fawaz_urls:
+        try:
+            r = requests.get(f"{url}?_ts={int(time.time())}", timeout=8, headers=headers)
+            if r.status_code == 200:
+                rub = r.json().get("krw", {}).get("rub")
+                if rub and float(rub) > 0:
+                    return _save(1_000_000 * float(rub), "Fallback-2 fawazahmed0")
+        except Exception as e:
+            logger.warning("[Fallback-2 %s] %s", url, e)
+
+    try:
+        r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8, headers=headers)
+        if r.status_code == 200:
+            krw = r.json().get("Valute", {}).get("KRW")
+            if krw and float(krw.get("Value", 0)) > 0 and int(krw.get("Nominal", 1)) > 0:
+                per_one_krw = float(krw["Value"]) / float(krw["Nominal"])
+                return _save(1_000_000 * per_one_krw, "Fallback-4 ЦБ РФ")
+    except Exception as e:
+        logger.warning("[Fallback-4] %s", e)
 
     return None
 
@@ -487,7 +557,6 @@ def _refresh_krw_google() -> Optional[float]:
 def _krw_google_updater() -> None:
     _refresh_krw_google()
     while True:
-        # Интервал 10 минут между обновлениями ядра, как ты и просил
         time.sleep(10 * 60)
         try:
             _refresh_krw_google()
@@ -676,7 +745,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     )
 
 
-def build_auto_message(rates: Dict[str, Optional[float]]:
+def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     usdt_krw   = rates.get("upbit")
     ab_buy     = rates.get("ab_buy")
     ab_sell    = rates.get("ab_sell")
