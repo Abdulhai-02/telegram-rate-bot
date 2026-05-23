@@ -94,7 +94,7 @@ if _MONGO_URI:
     except Exception as _exc:
         logger.error("❌ MongoDB недоступна: %s", _exc)
 else:
-    logger.warning("⚠️  MONGO_URI не задан — данные только in RAM")
+    logger.warning("⚠️  MONGO_URI не задан — данные только в RAM")
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ЛОКАЛИЗАЦИЯ
@@ -451,12 +451,25 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
-        # ИСПРАВЛЕНИЕ: Все регулярные выражения теперь захватывают [0-9.,]+ для обработки европейских запятых
-        m = re.search(r'\["KRW",\s*"RUB",\s*([\d.,]+)\s*,', html)
+        # ИСПРАВЛЕНИЕ: Все регулярные выражения теперь захватывают [0-9.,]+ для обработки европейских запятых во Франкфурте
+        m = re.search(r'class="[^"]*YMlKec fxKbKc[^"]*"[^>]*>([^<]+)<', html)
+        if not m:
+            m = re.search(r'class="[^"]*YMlKec[^"]*"[^>]*>([^<]+)<', html)
         if m:
-            v = float(m.group(1).replace(',', '.'))
-            if 0.03 < v < 0.15:
-                raw_price = v
+            clean_str = m.group(1).replace(',', '.').replace(' ', '').strip()
+            try:
+                v = float(clean_str)
+                if 0.03 < v < 0.15:
+                    raw_price = v
+            except ValueError:
+                pass
+
+        if raw_price is None:
+            m = re.search(r'\["KRW",\s*"RUB",\s*([\d.,]+)\s*,', html)
+            if m:
+                v = float(m.group(1).replace(',', '.'))
+                if 0.03 < v < 0.15:
+                    raw_price = v
 
         if raw_price is None:
             m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.,]+)["\']', html)
@@ -492,7 +505,7 @@ def _refresh_krw_google() -> Optional[float]:
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
-            logger.info("[Google] Курс получен: %.2f (raw=%.6f)", result, raw_price)
+            logger.info("[Google] ✅ Курс получен: %.2f (raw=%.6f)", result, raw_price)
             return result
         else:
             logger.warning("[Google] Точный паттерн цены не найден, переключаемся на чистый API Fallback")
@@ -657,7 +670,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого обновления с каждым кликом
+        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого обновления на каждый клик
         fg = pool.submit(_refresh_krw_google)
         fa = pool.submit(_fetch_abcex)
 
