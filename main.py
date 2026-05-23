@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""
+P2P Exchange Rate Telegram Bot
+Production-grade: thread-safe, Render-ready, MongoDB-backed.
+"""
+
 import os
 import logging
 import threading
@@ -37,21 +43,18 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
-# RENDER_URL — публичный URL вашего сервиса на Render, например:
-#   https://my-p2p-bot.onrender.com
-# Используется и для anti-sleep self-ping, и для регистрации webhook.
+# RENDER_URL — публичный URL сервиса во Франкфурте (без слеша на конце)
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
-# Опциональные ENV для ABCEX (см. диагностику в логах)
+# Опциональные ENV для ABCEX
 ABCEX_API_KEY:    str = os.getenv("ABCEX_API_KEY", "").strip()
 ABCEX_API_SECRET: str = os.getenv("ABCEX_API_SECRET", "").strip()
 ABCEX_PROXY:      str = os.getenv("ABCEX_PROXY", "").strip()
 
 # Секретный токен для проверки запросов от Telegram (X-Telegram-Bot-Api-Secret-Token).
-# Если не задан в окружении — генерируется один раз при старте.
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip() or secrets.token_urlsafe(32)
 
-# Путь webhook — содержит токен бота, чтобы посторонние не могли долбить URL.
+# Путь webhook — защищен токеном бота
 WEBHOOK_PATH: str = f"/webhook/{TELEGRAM_TOKEN}"
 
 _API_TIMEOUT  = 8
@@ -115,7 +118,7 @@ LANGS: Dict[str, Dict[str, str]] = {
         "auto_on_msg":  "Уведомление включено каждые",
         "feedback_ask": "Напишите ваш отзыв одним сообщением:",
         "feedback_ok":  "✅ Спасибо! Ваш отзыв передан администратору.",
-        "menu_updated": "🔄 Меню обновлено.",
+        "menu_updated": "🔄 Мею обновлено.",
         "prof_title":   "👤 <b>Ваш профиль</b>",
         "prof_reqs":    "Всего запросов:",
         "prof_last":    "Последний запрос:",
@@ -439,7 +442,7 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор Google Finance с 5 паттернами и немедленным fallback при неудаче."""
+    """Разбор Google Finance с жесткой рыночной фильтрацией (устранение бага 22700)."""
     url = "https://www.google.com/finance/quote/KRW-RUB"
     raw_price: Optional[float] = None
 
@@ -448,10 +451,11 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
+        # ИСПРАВЛЕНИЕ: Сужаем допустимые границы рынка до строгого диапазона воны (0.03 < v < 0.15)
         m = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+)\s*,', html)
         if m:
             v = float(m.group(1))
-            if 0.005 < v < 1.0:
+            if 0.03 < v < 0.15:
                 raw_price = v
 
         if raw_price is None:
@@ -460,15 +464,15 @@ def _refresh_krw_google() -> Optional[float]:
                 m = re.search(r'data-last-price=["\']([0-9.]+)["\'][^>]*?data-id=["\']KRWRUB["\']', html)
             if m:
                 v = float(m.group(1))
-                if 0.005 < v < 1.0:
+                if 0.03 < v < 0.15:
                     raw_price = v
 
         if raw_price is None:
-            candidates = re.findall(r'class="YMlKec[^"]*"[^>]*>([\d,. ]+)<', html)
+            candidates = re.findall(r'class="YMlKec[^"]*"[^>]*>([\d., ]+)<', html)
             for c in candidates:
                 try:
                     v = float(c.replace(',', '.').replace(' ', ''))
-                    if 0.005 < v < 1.0:
+                    if 0.03 < v < 0.15:
                         raw_price = v
                         break
                 except ValueError:
@@ -480,17 +484,10 @@ def _refresh_krw_google() -> Optional[float]:
                 m = re.search(r'"RUB"[^}]{0,80}"KRW"[^}]{0,80}(0\.\d{4,8})', html)
             if m:
                 v = float(m.group(1))
-                if 0.005 < v < 1.0:
+                if 0.03 < v < 0.15:
                     raw_price = v
 
-        if raw_price is None:
-            candidates = re.findall(r'\b(0\.0[0-9]{3,6})\b', html)
-            for c in candidates:
-                v = float(c)
-                if 0.005 < v < 0.15:
-                    raw_price = v
-                    logger.warning("[Google] Использован широкий паттерн, цена: %f", v)
-                    break
+        # Опасный широкий паттерн №5 полностью удален, так как он ошибочно цеплял мусорные значения 0.0227
 
         if raw_price is not None:
             result = 1_000_000 * raw_price
@@ -500,7 +497,7 @@ def _refresh_krw_google() -> Optional[float]:
             logger.info("[Google] Курс получен: %.2f (raw=%.6f)", result, raw_price)
             return result
         else:
-            logger.warning("[Google] Ни один паттерн не сработал, переход на fallback")
+            logger.warning("[Google] Точный паттерн цены не найден, переключаемся на чистый API Fallback")
 
     except Exception as exc:
         logger.error("[Google] Исключение при запросе: %s", exc)
@@ -509,14 +506,9 @@ def _refresh_krw_google() -> Optional[float]:
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """
-    Резервные источники фиатного курса KRW/RUB. Все рабочие на ноябрь 2026.
-    Возвращает курс в формате «сколько ₽ за 1 000 000 ₩».
-    """
+    """Резервные чистые фиатные шлюзы реального времени."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
     }
@@ -528,23 +520,18 @@ def _refresh_krw_google_fallback() -> Optional[float]:
         logger.info("[%s] KRW→RUB: %.2f", src, value)
         return value
 
-    # Источник 1: open.er-api.com (бесплатно, без ключа, стабильный)
     try:
         r = requests.get("https://open.er-api.com/v6/latest/KRW", timeout=8, headers=headers)
         if r.status_code == 200:
             rub = r.json().get("rates", {}).get("RUB")
             if rub and float(rub) > 0:
                 return _save(1_000_000 * float(rub), "Fallback-1 open.er-api")
-        else:
-            logger.warning("[Fallback-1] HTTP %d", r.status_code)
     except Exception as e:
         logger.warning("[Fallback-1] %s", e)
 
-    # Источник 2: fawazahmed0 currency-api (актуальные пути)
     fawaz_urls = [
         "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@1/v1/currencies/krw.json",
         "https://currency-api.pages.dev/v1/currencies/krw.json",
-        "https://latest.currency-api.pages.dev/v1/currencies/krw.json",
     ]
     for url in fawaz_urls:
         try:
@@ -556,20 +543,6 @@ def _refresh_krw_google_fallback() -> Optional[float]:
         except Exception as e:
             logger.warning("[Fallback-2 %s] %s", url, e)
 
-    # Источник 3: Frankfurter (ЕЦБ, бесплатно, без ключа)
-    try:
-        r = requests.get(
-            "https://api.frankfurter.dev/v1/latest?base=KRW&symbols=RUB",
-            timeout=8, headers=headers,
-        )
-        if r.status_code == 200:
-            rub = r.json().get("rates", {}).get("RUB")
-            if rub and float(rub) > 0:
-                return _save(1_000_000 * float(rub), "Fallback-3 frankfurter")
-    except Exception as e:
-        logger.warning("[Fallback-3] %s", e)
-
-    # Источник 4: ЦБ РФ (последний шанс)
     try:
         r = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=8, headers=headers)
         if r.status_code == 200:
@@ -580,7 +553,6 @@ def _refresh_krw_google_fallback() -> Optional[float]:
     except Exception as e:
         logger.warning("[Fallback-4] %s", e)
 
-    logger.error("[Fallback] Все источники недоступны — Google курс не получен")
     return None
 
 
@@ -595,20 +567,12 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """
-    Парсинг стакана ABCEX. Поддерживает:
-      • опциональный API-ключ (header X-API-KEY / Authorization Bearer)
-      • опциональный прокси (ABCEX_PROXY env) — нужен при гео-блоке Cloudflare
-      • детальный лог тела ответа при ошибке
-    """
+    """Парсинг стакана биржи ABCEX."""
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDT-RUB",
-        "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDT-RUB",
         "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
-        "https://api.abcex.io/api/v2/public/depth?symbol=usdtrub",
-        "https://api.abcex.io/api/v2/depth?symbol=usdtrub",
     ]
 
     auth_headers: Dict[str, str] = {}
@@ -624,21 +588,11 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         if isinstance(entry, dict):
             for key in ("price", "rate", "p", "value", "px"):
                 if key in entry:
-                    try:
-                        return float(entry[key])
-                    except (TypeError, ValueError):
-                        pass
+                    try: return float(entry[key])
+                    except (TypeError, ValueError): pass
         if isinstance(entry, (list, tuple)) and len(entry) >= 1:
-            try:
-                return float(entry[0])
-            except (TypeError, ValueError):
-                pass
-        if isinstance(entry, str):
-            part = entry.split(":")[0].split(",")[0].strip()
-            try:
-                return float(part)
-            except ValueError:
-                pass
+            try: return float(entry[0])
+            except (TypeError, ValueError): pass
         return None
 
     def _extract_side(data: dict, bid_keys, ask_keys):
@@ -673,30 +627,13 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
             body_preview = r.text[:300].replace("\n", " ")
 
             if r.status_code != 200:
-                logger.warning(
-                    "[ABCEX] HTTP %d %s | body: %s",
-                    r.status_code,
-                    url.split("?")[0].rsplit("/", 1)[-1],
-                    body_preview,
-                )
                 continue
 
-            try:
-                d = r.json()
-            except ValueError:
-                logger.warning("[ABCEX] Невалидный JSON: %s | body: %s", url, body_preview)
-                continue
-
-            if isinstance(d, list):
-                logger.warning("[ABCEX] Ответ — список, а не dict: %s", url)
-                continue
+            try: d = r.json()
+            except ValueError: continue
 
             bids, asks = _extract_side(d, BID_KEYS, ASK_KEYS)
             if not bids or not asks:
-                logger.warning(
-                    "[ABCEX] Стакан пуст / нет ключей: %s | keys=%s | body: %s",
-                    url, list(d.keys()), body_preview,
-                )
                 continue
 
             b_price = _extract_price(bids[0])
@@ -705,22 +642,11 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
             if b_price and a_price and b_price > 0 and a_price > 0:
                 logger.info("[ABCEX] ✅ bid=%.2f ask=%.2f ← %s", b_price, a_price, url)
                 return float(b_price), float(a_price)
-            else:
-                logger.warning("[ABCEX] Цена не извлечена: bid=%s ask=%s", bids[0], asks[0])
 
-        except requests.exceptions.ProxyError as e:
-            logger.error("[ABCEX] Прокси недоступен: %s", e)
-            continue
         except Exception as e:
             logger.error("[ABCEX] Ошибка %s: %s", url, e)
             continue
 
-    logger.critical(
-        "[ABCEX] Все эндпоинты недоступны — диагностика:\n"
-        "  • везде HTTP 403/503 → гео-блок Cloudflare → задайте ABCEX_PROXY\n"
-        "  • HTTP 401          → задайте ABCEX_API_KEY\n"
-        "  • HTTP 200 + пустой → формат ответа изменился"
-    )
     return None, None
 
 
@@ -804,6 +730,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
+    # ИСПРАВЛЕНИЕ: Добавлены скобки (0-1%) строго напротив курсов ABCEX
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -811,8 +738,8 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"  ◾ BITHUMB:  <b>{fmt_num(rates.get('bithumb'), 0)} ₩</b>\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇷🇺 <b>USDT → RUB  (ABCEX)</b>\n"
-        f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_raw,  2)} ₽</b>\n"
-        f"  🔴 {T['sell']}:  <b>{fmt_num(ab_sell_raw, 2)} ₽</b>\n"
+        f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_raw,  2)} ₽</b> (0-1%)\n"
+        f"  🔴 {T['sell']}:  <b>{fmt_num(ab_sell_raw, 2)} ₽</b> (0-1%)\n"
         f"━━━━━━━━━━━━━━━━\n\n"
         f"🇰🇷➡️🇷🇺 <b>KRW → RUB (кросс/Google)</b>\n"
         f"  🟢 {T['buy']}:   {krw_line_fmt(krw_buy)}\n"
@@ -892,15 +819,11 @@ def msg_show_rate(m: types.Message) -> None:
 
     anim = bot.send_message(m.chat.id, ".")
     time.sleep(0.4)
-    try:
-        bot.edit_message_text("..", m.chat.id, anim.message_id)
-    except Exception:
-        pass
+    try: bot.edit_message_text("..", m.chat.id, anim.message_id)
+    except Exception: pass
     time.sleep(0.4)
-    try:
-        bot.edit_message_text("...", m.chat.id, anim.message_id)
-    except Exception:
-        pass
+    try: bot.edit_message_text("...", m.chat.id, anim.message_id)
+    except Exception: pass
 
     with _krw_google_lock:
         _krw_google_cache["value"] = None
@@ -908,10 +831,8 @@ def msg_show_rate(m: types.Message) -> None:
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
-    try:
-        bot.delete_message(m.chat.id, anim.message_id)
-    except Exception:
-        pass
+    try: bot.delete_message(m.chat.id, anim.message_id)
+    except Exception: pass
 
     if not has_data:
         bot.send_message(m.chat.id, T["error_fetch"], parse_mode="HTML")
@@ -1040,10 +961,8 @@ def cb_auto(c: types.CallbackQuery) -> None:
         save_auto(uid)
         resp = f"✅ {T['auto_on_msg']} {val // 3600}H."
         log_action(c.from_user, "Авто ON", result=f"{val // 3600}H")
-    try:
-        bot.edit_message_text(resp, c.message.chat.id, c.message.message_id, parse_mode="HTML")
-    except Exception:
-        pass
+    try: bot.edit_message_text(resp, c.message.chat.id, c.message.message_id, parse_mode="HTML")
+    except Exception: pass
     bot.answer_callback_query(c.id)
 
 
@@ -1107,13 +1026,10 @@ def cb_admin(c: types.CallbackQuery) -> None:
         )
 
     elif action.startswith("users_"):
-        try:
-            page = int(action.split("_", 1)[1])
-        except ValueError:
-            page = 0
+        try: page = int(action.split("_", 1)[1])
+        except ValueError: page = 0
         PG = 8
-        with _DATA_LOCK:
-            all_ids = sorted(ALL_USER_IDS)
+        with _DATA_LOCK: all_ids = sorted(ALL_USER_IDS)
         total = len(all_ids)
         s = page * PG
         e = min(s + PG, total)
@@ -1131,22 +1047,15 @@ def cb_admin(c: types.CallbackQuery) -> None:
             txt += f"{icon} <code>{uid}</code>  {nick}\n"
             kb.add(types.InlineKeyboardButton(f"🔍 {nick}", callback_data=f"adm_detail_{uid}"))
         nav = []
-        if page > 0:
-            nav.append(types.InlineKeyboardButton("◀️", callback_data=f"adm_users_{page-1}"))
-        if e < total:
-            nav.append(types.InlineKeyboardButton("▶️", callback_data=f"adm_users_{page+1}"))
-        if nav:
-            kb.row(*nav)
+        if page > 0: nav.append(types.InlineKeyboardButton("◀️", callback_data=f"adm_users_{page-1}"))
+        if e < total: nav.append(types.InlineKeyboardButton("▶️", callback_data=f"adm_users_{page+1}"))
+        if nav: kb.row(*nav)
         bot.answer_callback_query(c.id)
-        try:
-            bot.edit_message_text(txt, c.message.chat.id, c.message.message_id,
-                                  parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            bot.send_message(c.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
+        try: bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=kb)
+        except Exception: bot.send_message(c.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
 
     elif action.startswith("detail_"):
-        try:
-            uid = int(action.split("_", 1)[1])
+        try: uid = int(action.split("_", 1)[1])
         except ValueError:
             bot.answer_callback_query(c.id)
             return
@@ -1175,11 +1084,8 @@ def cb_admin(c: types.CallbackQuery) -> None:
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("◀️ К списку", callback_data="adm_users_0"))
         bot.answer_callback_query(c.id)
-        try:
-            bot.edit_message_text(text, c.message.chat.id, c.message.message_id,
-                                  parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            bot.send_message(c.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+        try: bot.edit_message_text(text, c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=kb)
+        except Exception: bot.send_message(c.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
     elif action == "auto_menu":
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -1199,45 +1105,34 @@ def cb_admin(c: types.CallbackQuery) -> None:
             types.InlineKeyboardButton("5H",  callback_data="adm_all_18000"),
             types.InlineKeyboardButton("24H", callback_data="adm_all_86400"),
         )
-        bot.edit_message_text("⏳ Выберите интервал для <b>всех</b>:",
-                              c.message.chat.id, c.message.message_id,
-                              parse_mode="HTML", reply_markup=kb)
+        bot.edit_message_text("⏳ Выберите интервал для <b>всех</b>:", c.message.chat.id, c.message.message_id, parse_mode="HTML", reply_markup=kb)
 
     elif action.startswith("all_"):
-        try:
-            val = int(action.split("_", 1)[1])
+        try: val = int(action.split("_", 1)[1])
         except ValueError:
             bot.answer_callback_query(c.id)
             return
         hours = val // 3600
         ts    = now_msk()
         count = 0
-        with _DATA_LOCK:
-            ids_copy = set(ALL_USER_IDS)
+        with _DATA_LOCK: ids_copy = set(ALL_USER_IDS)
         for uid in ids_copy:
             try:
-                with _DATA_LOCK:
-                    AUTO_USERS[uid] = {"interval": val, "last": ts, "enabled_at": ts}
+                with _DATA_LOCK: AUTO_USERS[uid] = {"interval": val, "last": ts, "enabled_at": ts}
                 save_auto(uid)
                 count += 1
-            except Exception as exc:
-                logger.error("Тихая подписка %d: %s", uid, exc)
-        bot.edit_message_text(
-            f"✅ Подписка {hours}H для <b>{count}</b> чел.",
-            c.message.chat.id, c.message.message_id, parse_mode="HTML",
-        )
+            except Exception as exc: logger.error("Тихая подписка %d: %s", uid, exc)
+        bot.edit_message_text(f"✅ Подписка {hours}H для <b>{count}</b> чел.", c.message.chat.id, c.message.message_id, parse_mode="HTML")
         log_action(c.from_user, f"Массовая подписка {hours}H", result=f"{count} чел.")
 
     elif action == "auto_id":
         bot.answer_callback_query(c.id)
-        msg = bot.send_message(c.message.chat.id, "Введите <b>ID</b> пользователя:",
-                               parse_mode="HTML", reply_markup=types.ForceReply(selective=True))
+        msg = bot.send_message(c.message.chat.id, "Введите <b>ID</b> пользователя:", parse_mode="HTML", reply_markup=types.ForceReply(selective=True))
         bot.register_next_step_handler(msg, _adm_auto_get_id)
 
     elif action == "bc":
         bot.answer_callback_query(c.id)
-        msg = bot.send_message(c.message.chat.id, "✏️ Введите текст рассылки:",
-                               reply_markup=types.ForceReply(selective=True))
+        msg = bot.send_message(c.message.chat.id, "✏️ Введите текст рассылки:", reply_markup=types.ForceReply(selective=True))
         bot.register_next_step_handler(msg, _adm_broadcast)
 
     else:
@@ -1245,69 +1140,47 @@ def cb_admin(c: types.CallbackQuery) -> None:
 
 
 def _adm_auto_get_id(m: types.Message) -> None:
-    if not m.text:
-        return
-    try:
-        tid = int(m.text.strip())
+    if not m.text: return
+    try: tid = int(m.text.strip())
     except ValueError:
         bot.send_message(m.chat.id, "❌ Некорректный ID.", reply_markup=main_keyboard(m.from_user.id))
         return
-    msg = bot.send_message(
-        m.chat.id,
-        f"Интервал в <b>часах</b> (1/5/24) для <code>{tid}</code>:",
-        parse_mode="HTML", reply_markup=types.ForceReply(selective=True),
-    )
+    msg = bot.send_message(m.chat.id, f"Интервал в <b>часах</b> (1/5/24) для <code>{tid}</code>:", parse_mode="HTML", reply_markup=types.ForceReply(selective=True))
     bot.register_next_step_handler(msg, lambda s: _adm_auto_set(s, tid))
 
 
 def _adm_auto_set(m: types.Message, tid: int) -> None:
-    if not m.text:
-        return
+    if not m.text: return
     try:
         hours = int(m.text.strip())
-        if hours <= 0:
-            raise ValueError
+        if hours <= 0: raise ValueError
     except ValueError:
-        bot.send_message(m.chat.id, "❌ Введите положительное число.",
-                         reply_markup=main_keyboard(m.from_user.id))
+        bot.send_message(m.chat.id, "❌ Введите положительное число.", reply_markup=main_keyboard(m.from_user.id))
         return
     ts = now_msk()
-    with _DATA_LOCK:
-        AUTO_USERS[tid] = {"interval": hours * 3600, "last": ts, "enabled_at": ts}
+    with _DATA_LOCK: AUTO_USERS[tid] = {"interval": hours * 3600, "last": ts, "enabled_at": ts}
     save_auto(tid)
-    bot.send_message(
-        m.chat.id,
-        f"✅ <code>{tid}</code> — каждые <b>{hours}H</b>.",
-        parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id),
-    )
+    bot.send_message(m.chat.id, f"✅ <code>{tid}</code> — каждые <b>{hours}H</b>.", parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
     log_action(m.from_user, f"Тихая подписка {tid}", result=f"{hours}H")
 
 
 def _adm_broadcast(m: types.Message) -> None:
     if not m.text or not m.text.strip():
-        bot.send_message(m.chat.id, "❌ Пустое сообщение.",
-                         reply_markup=main_keyboard(m.from_user.id))
+        bot.send_message(m.chat.id, "❌ Пустое сообщение.", reply_markup=main_keyboard(m.from_user.id))
         return
     def _do_broadcast() -> None:
-        with _DATA_LOCK:
-            ids = set(ALL_USER_IDS)
+        with _DATA_LOCK: ids = set(ALL_USER_IDS)
         sent = failed = 0
         for uid in ids:
             try:
                 bot.send_message(uid, f"📢 <b>Уведомление</b>\n\n{m.text}", parse_mode="HTML")
                 sent += 1
                 time.sleep(0.05)
-            except Exception:
-                failed += 1
-        bot.send_message(
-            m.chat.id,
-            f"✅ Готово. Доставлено: <b>{sent}</b>  ❌ Ошибок: <b>{failed}</b>",
-            parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id),
-        )
+            except Exception: failed += 1
+        bot.send_message(m.chat.id, f"✅ Готово. Доставлено: <b>{sent}</b>  ❌ Ошибок: <b>{failed}</b>", parse_mode="HTML", reply_markup=main_keyboard(m.from_user.id))
         log_action(m.from_user, "Рассылка", result=f"sent={sent} failed={failed}")
     threading.Thread(target=_do_broadcast, daemon=True).start()
-    bot.send_message(m.chat.id, "⏳ Рассылка запущена...",
-                     reply_markup=main_keyboard(m.from_user.id))
+    bot.send_message(m.chat.id, "⏳ Рассылка запущена...", reply_markup=main_keyboard(m.from_user.id))
 
 
 @bot.message_handler(func=lambda m: True)
@@ -1333,8 +1206,7 @@ def _auto_worker() -> None:
                     for cid, cfg in AUTO_USERS.items()
                     if _elapsed_sec(cfg.get("last")) >= cfg["interval"]
                 }
-            if not due:
-                continue
+            if not due: continue
             rates = fetch_auto_rates()
             has_data = any(v is not None for v in rates.values())
             if not has_data:
@@ -1352,8 +1224,7 @@ def _auto_worker() -> None:
                     err = str(exc).lower()
                     if any(kw in err for kw in ("blocked","not found","deactivated","forbidden","chat not found")):
                         logger.warning("auto_worker: %d заблокировал бота — удаляем", cid)
-                        with _DATA_LOCK:
-                            AUTO_USERS.pop(cid, None)
+                        with _DATA_LOCK: AUTO_USERS.pop(cid, None)
                         save_auto(cid)
                     else:
                         logger.error("auto_worker %d: %s", cid, exc)
@@ -1366,19 +1237,12 @@ def _auto_worker() -> None:
 #  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
-    """
-    В webhook-режиме входящий HTTP-трафик от Telegram сам по себе не даёт
-    Render усыпить контейнер при активных пользователях. Но если бот стоит
-    без действий 15+ минут, Render всё равно усыпит сервис. Само-пинг по
-    /ping каждые 10 минут это лечит.
-    """
     _INTERVAL   = 10 * 60
     _PING_AGENT = requests.Session()
     _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
 
     def _ping_self() -> None:
-        if not RENDER_URL:
-            return
+        if not RENDER_URL: return
         try:
             r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
             logger.info("🏓 anti_sleep self-ping: HTTP %d", r.status_code)
@@ -1402,50 +1266,25 @@ def _anti_sleep_worker() -> None:
 #  ЗАХВАТ ТОКЕНА У СТАРОГО КОНТЕЙНЕРА
 # ═══════════════════════════════════════════════════════════════════════
 def _force_takeover_token() -> None:
-    """
-    Гарантированно отбирает токен у старого контейнера Render перед стартом.
-
-    Шаги:
-      1. deleteWebhook?drop_pending_updates=true — снимает webhook И ломает
-         long-polling у любого старого инстанса (если тот делал getUpdates).
-      2. 3 коротких getUpdates с offset=-1, timeout=0 — выталкивают любого,
-         кто продолжает polling, и подтверждают, что токен наш.
-      3. Пауза между попытками, чтобы старый процесс успел упасть.
-
-    После takeover в `main` будет вызван setWebhook на новый URL —
-    с этого момента старый контейнер физически не может получать апдейты.
-    """
     base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
     try:
-        r = requests.post(
-            f"{base_url}/deleteWebhook",
-            params={"drop_pending_updates": "true"},
-            timeout=10,
-        )
-        logger.info("Takeover: deleteWebhook → HTTP %d | %s",
-                    r.status_code, r.text[:120])
+        r = requests.post(f"{base_url}/deleteWebhook", params={"drop_pending_updates": "true"}, timeout=10)
+        logger.info("Takeover: deleteWebhook → HTTP %d | %s", r.status_code, r.text[:120])
     except Exception as exc:
         logger.warning("Takeover: deleteWebhook failed: %s", exc)
 
     for attempt in range(1, 4):
         try:
-            r = requests.post(
-                f"{base_url}/getUpdates",
-                json={"offset": -1, "timeout": 0, "limit": 1},
-                timeout=15,
-            )
+            r = requests.post(f"{base_url}/getUpdates", json={"offset": -1, "timeout": 0, "limit": 1}, timeout=15)
             if r.status_code == 200:
                 logger.info("Takeover [%d/3]: getUpdates OK — токен наш", attempt)
             elif r.status_code == 409:
                 logger.warning("Takeover [%d/3]: 409 — старый контейнер жив, ждём", attempt)
             else:
-                logger.warning("Takeover [%d/3]: HTTP %d | %s",
-                               attempt, r.status_code, r.text[:120])
+                logger.warning("Takeover [%d/3]: HTTP %d | %s", attempt, r.status_code, r.text[:120])
         except Exception as exc:
             logger.warning("Takeover [%d/3]: %s", attempt, exc)
         time.sleep(3)
-
     logger.info("✅ Takeover завершён")
 
 
@@ -1453,19 +1292,11 @@ def _force_takeover_token() -> None:
 #  УСТАНОВКА WEBHOOK
 # ═══════════════════════════════════════════════════════════════════════
 def _setup_webhook() -> bool:
-    """
-    Регистрирует webhook у Telegram. Возвращает True при успехе.
-
-    Если RENDER_URL не задан — возвращает False и предупреждает в лог.
-    В этом случае main() должен упасть на polling, чтобы хоть как-то работать
-    (например, при локальном запуске).
-    """
     if not RENDER_URL:
         logger.warning("⚠️ RENDER_URL не задан — webhook невозможен, fallback на polling")
         return False
 
     webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
-
     try:
         result = bot.set_webhook(
             url=webhook_url,
@@ -1478,11 +1309,8 @@ def _setup_webhook() -> bool:
             logger.info("✅ Webhook зарегистрирован: %s", webhook_url)
             try:
                 info = bot.get_webhook_info()
-                logger.info("ℹ️  Webhook info: url=%s pending=%d last_error=%s",
-                            info.url, info.pending_update_count or 0,
-                            info.last_error_message or "—")
-            except Exception:
-                pass
+                logger.info("ℹ️ Webhook info: url=%s pending=%d last_error=%s", info.url, info.pending_update_count or 0, info.last_error_message or "—")
+            except Exception: pass
             return True
         else:
             logger.error("❌ set_webhook вернул False")
@@ -1519,46 +1347,23 @@ def ping_endpoint() -> Any:
 
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook() -> Any:
-    """
-    Эндпоинт, на который Telegram отправляет апдейты.
-
-    Защита:
-      • URL содержит токен бота — посторонние его не знают.
-      • Header `X-Telegram-Bot-Api-Secret-Token` — должен совпадать с
-        WEBHOOK_SECRET, который мы передали в set_webhook.
-      • Content-Type должен быть application/json.
-
-    Telegram ожидает ответ HTTP 200 в течение нескольких секунд, иначе
-    повторит апдейт. Поэтому реальная обработка апдейта запускается в
-    отдельном потоке, а мы сразу возвращаем 200.
-    """
-    # 1. Проверка секрета
     received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not secrets.compare_digest(received_secret, WEBHOOK_SECRET):
-        logger.warning("Webhook: неверный secret token (источник: %s)",
-                       request.remote_addr)
+        logger.warning("Webhook: неверный secret token (источник: %s)", request.remote_addr)
         abort(403)
 
-    # 2. Проверка Content-Type
     if request.headers.get("Content-Type", "").split(";")[0] != "application/json":
         abort(400)
 
-    # 3. Парсинг апдейта
     try:
         raw = request.get_data(as_text=True)
         update = telebot.types.Update.de_json(raw)
-        if update is None:
-            abort(400)
+        if update is None: abort(400)
     except Exception as exc:
         logger.error("Webhook: ошибка парсинга апдейта: %s", exc)
         abort(400)
 
-    # 4. Обработка в отдельном потоке (чтобы быстро вернуть 200)
-    threading.Thread(
-        target=lambda: bot.process_new_updates([update]),
-        daemon=True,
-    ).start()
-
+    threading.Thread(target=lambda: bot.process_new_updates([update]), daemon=True).start()
     return "", 200
 
 
@@ -1579,7 +1384,6 @@ def _notify_startup() -> None:
 
 
 def _polling_fallback() -> None:
-    """Используется только если RENDER_URL не задан (локальная отладка)."""
     logger.warning("⚠️ Запуск в режиме polling (только для локальной отладки)")
     while True:
         try:
@@ -1598,7 +1402,7 @@ def _polling_fallback() -> None:
 
 
 if __name__ == "__main__":
-    # 1. Захват токена у старого контейнера
+    # 1. Захват токена у старого инстанса
     _force_takeover_token()
 
     # 2. Загрузка БД
@@ -1609,31 +1413,22 @@ if __name__ == "__main__":
     threading.Thread(target=_anti_sleep_worker,  daemon=True, name="anti_sleep").start()
     threading.Thread(target=_krw_google_updater, daemon=True, name="krw_google").start()
 
-    # 4. Регистрация webhook (или fallback на polling)
+    # 4. Регистрация вебхука
     webhook_ok = _setup_webhook()
 
-    # 5. Уведомление в лог-канал
+    # 5. Пуш уведомления в лог-канал
     threading.Thread(target=_notify_startup, daemon=True).start()
 
-    # 6. Запуск
+    # 6. Запуск сервера Flask
     port = int(os.environ.get("PORT", 10_000))
 
     if webhook_ok:
-        # Webhook-режим: Flask в главном потоке, polling не нужен
         logger.info("🌐 Старт Flask в webhook-режиме на порту %d", port)
         try:
-            # Для продакшна лучше gunicorn — но Flask dev server тоже работает.
-            # Если хотите gunicorn — измените Render Start Command на:
-            #   gunicorn --workers 1 --threads 8 --bind 0.0.0.0:$PORT main:flask_app
-            # и удалите блок ниже (Render будет сам стартовать flask_app).
             flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False, threaded=True)
         except Exception as exc:
             logger.critical("Flask упал: %s", exc)
     else:
-        # Polling-режим (для локальной отладки без RENDER_URL)
-        threading.Thread(
-            target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False),
-            daemon=True, name="flask",
-        ).start()
+        threading.Thread(target=lambda: flask_app.run(host="0.0.0.0", port=port, use_reloader=False, debug=False), daemon=True, name="flask").start()
         logger.info("🌐 Flask на порту %d (вспомогательный)", port)
         _polling_fallback()
