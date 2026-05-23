@@ -442,7 +442,7 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор Google Finance с локализационной нормализацией запятых европейских серверов."""
+    """Разбор Google Finance с локализационной нормализацией запятых европейских серверов во Франкфурте."""
     url = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_ts={int(time.time())}"
     raw_price: Optional[float] = None
 
@@ -451,12 +451,11 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
-        # ИСПРАВЛЕНИЕ: Все регулярные выражения теперь захватывают [0-9.,]+ для обработки европейских запятых во Франкфурте
-        m = re.search(r'class="[^"]*YMlKec fxKbKc[^"]*"[^>]*>([^<]+)<', html)
-        if not m:
-            m = re.search(r'class="[^"]*YMlKec[^"]*"[^>]*>([^<]+)<', html)
+        # ПРОФИ-ПАТТЕРН 1: Прямой захват текстового контейнера уникального класса fxKbKc (европейская верстка)
+        m = re.search(r'class="[^"]*fxKbKc[^"]*"[^>]*>([^<]+)<', html)
         if m:
-            clean_str = m.group(1).replace(',', '.').replace(' ', '').strip()
+            clean_str = m.group(1).replace(',', '.').replace(' ', '').replace('\xa0', '').strip()
+            clean_str = re.sub(r'[^\d.]', '', clean_str)
             try:
                 v = float(clean_str)
                 if 0.03 < v < 0.15:
@@ -464,13 +463,15 @@ def _refresh_krw_google() -> Optional[float]:
             except ValueError:
                 pass
 
+        # ПРОФИ-ПАТТЕРН 2: Поиск во внутреннем JSON-конфигураторе скриптов Google (с обработкой кавычек и запятых)
         if raw_price is None:
-            m = re.search(r'\["KRW",\s*"RUB",\s*([\d.,]+)\s*,', html)
+            m = re.search(r'\["KRW",\s*"RUB",\s*"??([\d.,]+)"??\s*,', html)
             if m:
                 v = float(m.group(1).replace(',', '.'))
                 if 0.03 < v < 0.15:
                     raw_price = v
 
+        # ПРОФИ-ПАТТЕРН 3: Каскадная селекция через data-атрибуты рынка
         if raw_price is None:
             m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.,]+)["\']', html)
             if not m:
@@ -480,6 +481,7 @@ def _refresh_krw_google() -> Optional[float]:
                 if 0.03 < v < 0.15:
                     raw_price = v
 
+        # ПРОФИ-ПАТТЕРН 4: Глубокое сканирование структуры альтернативных контейнеров YMlKec
         if raw_price is None:
             candidates = re.findall(r'class="YMlKec[^"]*"[^>]*>([\d., ]+)<', html)
             for c in candidates:
@@ -491,21 +493,12 @@ def _refresh_krw_google() -> Optional[float]:
                 except ValueError:
                     continue
 
-        if raw_price is None:
-            m = re.search(r'"KRW"[^}]{0,80}"RUB"[^}]{0,80}(0[\d.,]{4,8})', html)
-            if not m:
-                m = re.search(r'"RUB"[^}]{0,80}"KRW"[^}]{0,80}(0[\d.,]{4,8})', html)
-            if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 0.03 < v < 0.15:
-                    raw_price = v
-
         if raw_price is not None:
             result = 1_000_000 * raw_price
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
-            logger.info("[Google] ✅ Курс получен: %.2f (raw=%.6f)", result, raw_price)
+            logger.info("[Google] ✅ Точный курс успешно получен: %.2f (raw=%.6f)", result, raw_price)
             return result
         else:
             logger.warning("[Google] Точный паттерн цены не найден, переключаемся на чистый API Fallback")
@@ -670,7 +663,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого обновления на каждый клик
+        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого обновления на каждый клик пользователя
         fg = pool.submit(_refresh_krw_google)
         fa = pool.submit(_fetch_abcex)
 
@@ -740,7 +733,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
-    # ИСПРАВЛЕНИЕ: Заменён эмодзи стрелки на круговой маркер обмена 🔄 и добавлен текст "по МСК"
+    # ИСПРАВЛЕНИЕ: Изменен эмодзи кросс-курса на 🇰🇷🔄🇷🇺 и добавлен текст "по МСК"
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
