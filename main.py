@@ -368,11 +368,12 @@ _thread_local = threading.local()
 
 
 def _get_session() -> requests.Session:
-    """Сессия уровня Pro с полной эмуляцией структуры сетевых заголовков Chrome."""
+    """Сессия с эмуляцией отпечатка браузера и обходом защиты Google (Cookie CONSENT)."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908", 
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
@@ -402,10 +403,11 @@ def _fetch_bithumb() -> Optional[float]:
         data = r.json()
         if isinstance(data, list) and data:
             return float(data[0].get("trade_price", 0))
-    except:
+    except Exception:
         pass
     try:
         r = _get_session().get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=_API_TIMEOUT)
+        r.raise_for_status()
         return float(r.json()["data"]["closing_price"])
     except Exception as exc:
         logger.warning("Bithumb Error: %s", exc)
@@ -432,7 +434,7 @@ def _refresh_krw_google() -> Optional[float]:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         
-        match = re.search(r'data-last-price="([\d.]+)"', r.text)
+        match = re.search(r'data-id="KRWRUB"[^>]*data-last-price="([\d.]+)"', r.text)
         if not match:
             match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
             
@@ -443,7 +445,8 @@ def _refresh_krw_google() -> Optional[float]:
             
         if match:
             price = float(match.group(1))
-            if 0.001 < price < 10.0:
+            # Математическая защита: 1 вон стоит от 0.01 до 1.0 рубля
+            if 0.01 < price < 1.0:
                 result = 1_000_000 * price
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
@@ -467,7 +470,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
             return result
-    except:
+    except Exception:
         pass
     try:
         r = requests.get("https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000", timeout=7)
@@ -477,7 +480,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
             return result
-    except:
+    except Exception:
         pass
     return None
 
@@ -493,7 +496,7 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """Профессиональный сбор биржевого стакана ABCEX USDTRUB с автоматической конвертацией в типы float."""
+    """Исключительно парсинг ABCEX, никаких сторонних бирж или резервов."""
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
@@ -517,13 +520,15 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
         except Exception as exc:
             logger.warning("ABCEX сбой узла [%s]: %s", url, exc)
             continue
+            
+    # Если ABCEX не ответил, мы честно возвращаем None (не подменяя Garantex/MEXC)
     return None, None
 
 
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
     try:
         return future.result(timeout=_API_MAX_WAIT)
-    except:
+    except Exception:
         return default
 
 
@@ -550,8 +555,9 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
         
+    # ИСПРАВЛЕНИЕ: Множитель 1.006 (прибавка +0.6% к финальному курсу, как и просил в тихую)
     if upbit and upbit > 0 and usdt_rub_mid is not None:
-        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
+        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.006
     else:
         krw_rub = None
         
@@ -586,9 +592,10 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     krw_google = rates.get("krw_google") 
     upbit = rates.get("upbit")
     
+    # ИСПРАВЛЕНИЕ: Множитель 1.006 (прибавка +0.6%) для покупки и продажи
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
-            return (1_000_000 * usdt_price / upbit) * 0.994
+            return (1_000_000 * usdt_price / upbit) * 1.006
         return None
 
     krw_buy  = krw_from_usdt(ab_buy_raw)   
@@ -1254,18 +1261,18 @@ if __name__ == "__main__":
 
     logger.info("🤖 Бот запущен")
     
-    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта
+    # Отправка стартового пуш-сообщения администратору ДО начала цикла пуллинга
+    try:
+        bot.send_message(MY_ADMIN_ID, "🚀 <b>Бот успешно перезагружен и готов к работе!</b>", parse_mode="HTML")
+        logger.info("Стартовое уведомление успешно отправлено администратору")
+    except Exception as admin_err:
+        logger.warning("Не удалось отправить пуш администратору: %s", admin_err)
+
+    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта и лишнего спама
     while True:
         try:
-            # Отправка стартового пуш-сообщения администратору
-            try:
-                bot.send_message(MY_ADMIN_ID, "🚀 <b>Бот успешно перезагружен и готов к работе!</b>", parse_mode="HTML")
-                logger.info("Стартовое уведомление отправлено администратору")
-            except Exception as admin_err:
-                logger.warning("Не удалось отправить пуш администратору: %s", admin_err)
-                
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
-            break # Если пуллинг завершился штатно — выходим из цикла
+            break 
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 409:
                 logger.warning("Обнаружен перехват токена старым контейнером Render (Ошибка 409). Ожидание завершения... Повтор через 5 секунд.")
