@@ -427,25 +427,29 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор внутренней JS-компоненты Google Finance с жестким исключением ложных масштабов (1.000)."""
-    url = "https://www.google.com/finance/quote/KRW-RUB"
+    """Разбор внутренней JS-компоненты Google Finance с валидацией границ рынка."""
+    # Шаг 1: Запрос через мобильный виджет Google
     try:
-        r = _get_session().get(url, timeout=10)
+        url_search = f"https://www.google.com/search?q=1000000+krw+to+rub&hl=ru&_ts={int(time.time())}"
+        r = _get_session().get(url_search, timeout=10)
+        match = re.search(r'data-value="([\d.]+)"', r.text)
+        if match:
+            val = float(match.group(1))
+            if 30000 < val < 100000:
+                with _krw_google_lock:
+                    _krw_google_cache["value"]   = val
+                    _krw_google_cache["updated"] = now_msk()
+                return val
+    except Exception:
+        pass
+
+    # Шаг 2: Разбор страницы Google Finance
+    try:
+        url_fin = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_cb={int(time.time())}"
+        r = _get_session().get(url_fin, timeout=10)
         r.raise_for_status()
         
-        # Шаг 1: Извлекаем курс из JSON-конфигурации скриптов Google (самый надежный способ против изменения верстки)
-        json_match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
-        if json_match:
-            price = float(json_match.group(1))
-            if 0.01 < price < 0.2:  # Исключаем ложный перехват единицы масштаба
-                result = 1_000_000 * price
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("Шлюз Google Finance JSON-Блок успешен: %.2f", result)
-                return result
-
-        # Шаг 2: Каскадный поиск по уникальному тегу пары
+        # Точечный поиск
         match = re.search(r'data-id="KRWRUB"[^>]*?data-last-price="([\d.]+)"', r.text)
         if not match:
             match = re.search(r'class="YMlKec fxKbKc"[^>]*?>([\d.,]+)', r.text)
@@ -453,15 +457,15 @@ def _refresh_krw_google() -> Optional[float]:
         if match:
             raw_val = match.group(1).replace(',', '.')
             price = float(raw_val)
+            
+            # Математическая валидация: цена 1 воны должна лежать в пределах рынка (0.01 - 0.20 руб)
             if 0.01 < price < 0.2:
                 result = 1_000_000 * price
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
                     _krw_google_cache["updated"] = now_msk()
-                logger.info("Шлюз Google Finance HTML-Тег успешен: %.2f", result)
+                logger.info("Шлюз Google Finance успешен: %.2f", result)
                 return result
-            else:
-                logger.warning("[Аудит] Отброшен ложный масштаб Google Finance: %f", price)
     except Exception as exc:
         logger.error("Исключение Google Finance: %s", exc)
         
@@ -469,22 +473,12 @@ def _refresh_krw_google() -> Optional[float]:
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Резервные чистые фиатные шлюзы реального времени без задержек."""
+    """Резервные фиатные шлюзы."""
     try:
         r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=7)
         krw = r.json()["rates"].get("KRW")
         if krw:
             result = 1_000_000 / float(krw)
-            with _krw_google_lock:
-                _krw_google_cache["value"]   = result
-                _krw_google_cache["updated"] = now_msk()
-            return result
-    except:
-        pass
-    try:
-        r = requests.get("https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000", timeout=7)
-        if r.status_code == 200:
-            result = float(r.json()["result"])
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
@@ -509,20 +503,15 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
-        "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
-        "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDT-RUB",
-        "https://api.abcex.io/api/v2/public/depth?symbol=usdtrub",
-        "https://api.abcex.io/api/v2/depth?symbol=usdtrub"
+        "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB"
     ]
     for url in urls:
         try:
-            # Разрушение кэша Cloudflare через уникальный UNIX-таймстамп
             ts_url = f"{url}&_={int(time.time() * 1000)}" if "?" in url else f"{url}?_={int(time.time() * 1000)}"
             r = _get_session().get(ts_url, timeout=_API_TIMEOUT)
             
             if r.status_code == 200:
                 d = r.json()
-                
                 bids, asks = None, None
                 for b_key in ["bid", "bids", "buy", "data"]:
                     if b_key in d and d[b_key]:
@@ -544,12 +533,10 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
                     if b_val and a_val:
                         return float(b_val), float(a_val)
             else:
-                logger.warning("[Аудит ABCEX] Код ответа сервера %d для маршрута: %s", r.status_code, url)
+                logger.error("[Аудит ABCEX] Ошибка %d при запросе: %s. Ответ: %s", r.status_code, url, r.text[:100])
         except Exception as e:
-            logger.error("[Аудит ABCEX] Ошибка подключения к узлу %s: %s", url, e)
+            logger.error("[Аудит ABCEX] Exception для %s: %s", url, e)
             continue
-            
-    logger.critical("[Аудит ABCEX] Ни один из измененных эндпоинтов ABCEX не отдал стакан.")
     return None, None
 
 
@@ -583,7 +570,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
         
-    # ИСПРАВЛЕНИЕ: Вычитаем комиссию -0.6% (умножаем на 0.994) во время считывания кросс-курса
+    # ИСПРАВЛЕНИЕ: Вычитаем -0.6% комиссии (0.994) во время считывания кросс-курса
     if upbit and upbit > 0 and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
     else:
@@ -620,7 +607,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     krw_google = rates.get("krw_google") 
     upbit = rates.get("upbit")
     
-    # ИСПРАВЛЕНИЕ: Математический вычет комиссии -0.6% (0.994) на покупку и продажу кросс-курса воны
+    # ИСПРАВЛЕНИЕ: Применяем -0.6% комиссии (0.994) только при расчете кросс-курса
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
             return (1_000_000 * usdt_price / upbit) * 0.994
@@ -631,12 +618,12 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
 
     def krw_line_fmt(val: Optional[float]) -> str:
         if val is not None and krw_google is not None:
-            return f"<b>{fmt_num(val, 0)} ₽</b>  ({fmt_num(krw_google, 0)} ₽)"
+            return f"<b>{fmt_num(val, 0)} ₽</b>  ({fmt_num(krw_google, 0)})"
         if val is not None:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
-    # ИСПРАВЛЕНИЕ: Цены ABCEX выводятся абсолютно чистыми, без наценок и процентов
+    # ABCEX — чистые цены без процентов
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -1288,23 +1275,22 @@ if __name__ == "__main__":
     ).start()
     logger.info("🌐 Flask на порту %d", port)
 
-    startup_notified = False
+    logger.info("🤖 Бот запущен")
+    
+    # ИСПРАВЛЕНИЕ: Отправка логов о перезагрузке СТРОГО В ТВОЙ КАНАЛ, исключая спам в личку
+    try:
+        bot.send_message(
+            ADMIN_LOG_CHAT_ID, 
+            "🚀 <b>Система управления курсами успешно перезагружена на Render и готова к работе!</b>", 
+            parse_mode="HTML"
+        )
+        logger.info("Уведомление о перезагрузке успешно отправлено в лог-канал.")
+    except Exception as channel_err:
+        logger.warning("Не удалось отправить пуш в лог-канал: %s", channel_err)
 
+    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта и лишнего спама
     while True:
         try:
-            # ИСПРАВЛЕНИЕ: Отправка логов о перезагрузке СТРОГО В ТВОЙ КАНАЛ, исключая спам в личку
-            if not startup_notified:
-                try:
-                    bot.send_message(
-                        ADMIN_LOG_CHAT_ID, 
-                        "🚀 <b>Система управления курсами успешно перезагружена на Render и готова к работе!</b>\n\n<i>Все новые лог-сессии перенаправлены в этот канал.</i>", 
-                        parse_mode="HTML"
-                    )
-                    logger.info("Уведомление о перезагрузке успешно отправлено в лог-канал.")
-                    startup_notified = True
-                except Exception as channel_err:
-                    logger.warning("Не удалось отправить пуш в лог-канал: %s", channel_err)
-
             bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
             break 
         except telebot.apihelper.ApiTelegramException as e:
