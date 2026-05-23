@@ -375,18 +375,13 @@ def _get_session() -> requests.Session:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
-            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
             "Sec-Ch-Ua-Mobile": "?0",
             "Sec-Ch-Ua-Platform": '"Windows"',
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1"
         })
         _thread_local.session = s
     return _thread_local.session
@@ -451,22 +446,26 @@ def _fetch_krw_rub_google() -> Optional[float]:
 def _refresh_krw_google() -> Optional[float]:
     """
     Высокоуровневый разбор нативного встроенного JSON-компонента Google Finance.
-    Обеспечивает получение живого межбанковского курса без риска блокировок.
+    Обходит капчу за счет чтения сырого скрипта разметки.
     """
     url = "https://www.google.com/finance/quote/KRW-RUB"
     try:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         
-        # Google Finance хранит текущие котировки внутри структурированного JSON-массива данных на странице
+        # Обновленный под май 2026 паттерн поиска котировок в разметке Google Finance
         match = re.search(r'data-last-price="([\d.]+)"', r.text)
         if not match:
-            # Запасной паттерн для внутренней JSON-структуры Google Finance
             match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
+        if not match:
+            # Третий слой защиты: парсинг из JS-блока window.DATA_RESPONSE
+            js_match = re.search(r'KRW-RUB[^]*?([\d.]+)', r.text)
+            if js_match:
+                match = js_match
             
         if match:
             price = float(match.group(1))
-            if price > 0:
+            if 0.001 < price < 10.0:  # Валидация разумных границ котировки воны к рублю
                 result = 1_000_000 * price
                 with _krw_google_lock:
                     _krw_google_cache["value"]   = result
@@ -474,7 +473,7 @@ def _refresh_krw_google() -> Optional[float]:
                 logger.info("Нативный шлюз Google Finance успешен: %.2f", result)
                 return result
         else:
-            logger.warning("Не удалось разобрать JSON-структуру Google Finance")
+            logger.warning("Не удалось разобрать структуру Google Finance")
             
     except Exception as exc:
         logger.error("Исключение при обращении к Google Finance: %s", exc)
@@ -483,7 +482,7 @@ def _refresh_krw_google() -> Optional[float]:
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Резервные чистые фиатные шлюзы (exchangerate и er-api) без использования сторонних бирж."""
+    """Резервные чистые фиатные шлюзы (er-api и exchangerate) без сторонних бирж."""
     try:
         r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=7)
         krw = r.json()["rates"].get("KRW")
