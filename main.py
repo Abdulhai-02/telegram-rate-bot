@@ -157,11 +157,14 @@ LANGS: Dict[str, Dict[str, str]] = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-#  RAM-ХРАНИЛИЩЕ
+#  RAM-ХРАНИЛИЩЕ И КЭШ
 # ═══════════════════════════════════════════════════════════════════════
 USER_DATA:    Dict[int, Dict[str, Any]] = {}
 AUTO_USERS:   Dict[int, Dict[str, Any]] = {}
 ALL_USER_IDS: set                       = set()
+
+_krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
+_krw_google_lock  = threading.Lock()
 
 # ═══════════════════════════════════════════════════════════════════════
 #  УТИЛИТЫ
@@ -321,7 +324,7 @@ def init_user(tg_user: types.User) -> None:
         except Exception as exc:
             logger.error("init_user read(%d): %s", uid, exc)
     new_profile: Dict[str, Any] = {
-        "lang":       "ru",
+        "ru",
         "requests":   0,
         "last":       None,
         "joined":     now_msk(),
@@ -386,7 +389,7 @@ _thread_local = threading.local()
 def _get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        # ИСПРАВЛЕНИЕ: Внедряем европейские анти-блокировочные куки SOCS и AEC для пробития экрана согласия ЕС
+        # Внедрение кук SOCS и AEC для сквозного прохода Consent Wall в Германии
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908; SOCS=CAISHAgBEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwNDA5LjA2X3AwGgVydS1SVSgB; AEC=AVYB7coM1X",
@@ -426,42 +429,45 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
-# ── Кэш Google-курса KRW/RUB ──────────────────────────────────────────
-_krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
-_krw_google_lock  = threading.Lock()
-
-
+# ── Интеллектуальный шлюз Google Finance ──────────────────────────────
 def _fetch_krw_rub_google() -> Optional[float]:
+    """Возвращает курс кэша, если ему меньше 10 минут, защищая IP от блокировок."""
     with _krw_google_lock:
         cached = _krw_google_cache["value"]
-    if cached is not None:
-        return cached
+        updated = _krw_google_cache["updated"]
+    
+    # СХЕМА ЗАЩИТЫ: Если кэш свежее 10 минут (600 секунд) — отдаем без отправки запроса
+    if cached is not None and updated is not None:
+        if _elapsed_sec(updated) < 600:
+            return cached
+            
     return _refresh_krw_google()
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Профессиональный адаптивный парсер Google Finance с разбором системных JSON-массивов."""
-    url = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_ts={int(time.time())}"
-    raw_price: Optional[float] = None
+    """Разбор стабильной пары RUB-KRW из ядра скриптов с вычислением 1 000 000 / v."""
+    url = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&_ts={int(time.time())}"
+    raw_v: Optional[float] = None
 
     try:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         html = r.text
 
-        # ПРОФИ-ПАТТЕРН 1: Парсинг иммутабельного JSON-массива данных ядра Google (независим от региональной верстки)
-        m = re.search(r'\[\s*["\']KRW["\']\s*,\s*["\']RUB["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
+        # ИСПРАВЛЕНИЕ: Вырезаем данные из иммутабельного JSON-массива RUB-KRW
+        m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
         if m:
             v_str = m.group(1).replace(',', '.')
             try:
                 v = float(v_str)
-                if 0.035 < v < 0.085:
-                    raw_price = v
+                # Жёсткий рыночный коридор для вон за 1 рубль (банит мусорные 0.0227%)
+                if 10.0 < v < 25.0:
+                    raw_v = v
             except ValueError:
                 pass
 
-        # ПРОФИ-ПАТТЕРН 2: Поиск по европейскому строковому контейнеру класса fxKbKc / YMlKec с нормализацией запятых
-        if raw_price is None:
+        # Альтернативный разбор европейских классов верстки fxKbKc / YMlKec
+        if raw_v is None:
             container_matches = re.findall(r'class="[^"]*(?:fxKbKc|YMlKec)[^"]*"[^>]*>([^<]+)<', html)
             for c in container_matches:
                 clean_str = c.replace(',', '.').replace(' ', '').replace('\xa0', '').strip()
@@ -470,31 +476,22 @@ def _refresh_krw_google() -> Optional[float]:
                     continue
                 try:
                     v = float(clean_str)
-                    if 0.035 < v < 0.085:
-                        raw_price = v
+                    if 10.0 < v < 25.0:
+                        raw_v = v
                         break
                 except ValueError:
                     continue
 
-        # ПРОФИ-ПАТТЕРН 3: Резервное сканирование мета-атрибутов котировки рынка
-        if raw_price is None:
-            m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.,]+)["\']', html)
-            if not m:
-                m = re.search(r'data-last-price=["\']([0-9.,]+)["\'][^>]*?data-id=["\']KRWRUB["\']', html)
-            if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 0.035 < v < 0.085:
-                    raw_price = v
-
-        if raw_price is not None:
-            result = 1_000_000 * raw_price
+        if raw_v is not None:
+            # КАРДИНАЛЬНОЕ ИСПРАВЛЕНИЕ: Магическая формула старого кода: 1 000 000 / v
+            result = 1_000_000 / raw_v
             with _krw_google_lock:
                 _krw_google_cache["value"]   = result
                 _krw_google_cache["updated"] = now_msk()
-            logger.info("[Google] ✅ Точный курс успешно получен из ядра Finance: %.2f (raw=%.6f)", result, raw_price)
+            logger.info("[Google] ✅ Курс RUB-KRW успешно получен: %.2f (v=%.4f)", result, raw_v)
             return result
         else:
-            logger.warning("[Google] Паттерн цены во Франкфурте отфильтровал мусор, запуск резервных шлюзов")
+            logger.warning("[Google] Паттерн RUB-KRW отфильтровал некорректные границы рынка, запуск API Fallback")
 
     except Exception as exc:
         logger.error("[Google] Исключение при запросе: %s", exc)
@@ -556,7 +553,8 @@ def _refresh_krw_google_fallback() -> Optional[float]:
 def _krw_google_updater() -> None:
     _refresh_krw_google()
     while True:
-        time.sleep(5 * 60)
+        # Интервал 10 минут между запросами к Google, как ты просил
+        time.sleep(10 * 60)
         try:
             _refresh_krw_google()
         except Exception as exc:
@@ -656,8 +654,8 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого принудительного обновления на каждый клик пользователя
-        fg = pool.submit(_refresh_krw_google)
+        # Вызов функции с 10-минутным кэшем защиты
+        fg = pool.submit(_fetch_krw_rub_google)
         fa = pool.submit(_fetch_abcex)
 
         upbit      = _safe_future(fu)
@@ -726,7 +724,6 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
-    # ИСПРАВЛЕНИЕ: Интегрирован эмодзи циклического обмена 🔄 и строка временной зоны "по МСК" в строгом соответствии с ТЗ
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -821,9 +818,7 @@ def msg_show_rate(m: types.Message) -> None:
     try: bot.edit_message_text("...", m.chat.id, anim.message_id)
     except Exception: pass
 
-    with _krw_google_lock:
-        _krw_google_cache["value"] = None
-
+    # Принудительное обнуление локального флага для ручной сессии (защита 10 минут при этом работает в _fetch_krw_rub_google)
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
