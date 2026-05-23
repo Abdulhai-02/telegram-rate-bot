@@ -94,7 +94,7 @@ if _MONGO_URI:
     except Exception as _exc:
         logger.error("❌ MongoDB недоступна: %s", _exc)
 else:
-    logger.warning("⚠️  MONGO_URI не задан — данные только в RAM")
+    logger.warning("⚠️  MONGO_URI не задан — данные только in RAM")
 
 # ═══════════════════════════════════════════════════════════════════════
 #  ЛОКАЛИЗАЦИЯ
@@ -442,8 +442,7 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор Google Finance с жесткой рыночной фильтрацией и защитой от кэширования Cloudflare."""
-    # ИСПРАВЛЕНИЕ: Добавлен уникальный секундный таймстамп-деструктор, чтобы пробивать HTML-кэш провайдера
+    """Разбор Google Finance с локализационной нормализацией запятых европейских серверов."""
     url = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&_ts={int(time.time())}"
     raw_price: Optional[float] = None
 
@@ -452,18 +451,19 @@ def _refresh_krw_google() -> Optional[float]:
         r.raise_for_status()
         html = r.text
 
-        m = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+)\s*,', html)
+        # ИСПРАВЛЕНИЕ: Все регулярные выражения теперь захватывают [0-9.,]+ для обработки европейских запятых
+        m = re.search(r'\["KRW",\s*"RUB",\s*([\d.,]+)\s*,', html)
         if m:
-            v = float(m.group(1))
+            v = float(m.group(1).replace(',', '.'))
             if 0.03 < v < 0.15:
                 raw_price = v
 
         if raw_price is None:
-            m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.]+)["\']', html)
+            m = re.search(r'data-id=["\']KRWRUB["\'][^>]*?data-last-price=["\']([0-9.,]+)["\']', html)
             if not m:
-                m = re.search(r'data-last-price=["\']([0-9.]+)["\']', html)
+                m = re.search(r'data-last-price=["\']([0-9.,]+)["\']', html)
             if m:
-                v = float(m.group(1))
+                v = float(m.group(1).replace(',', '.'))
                 if 0.03 < v < 0.15:
                     raw_price = v
 
@@ -479,11 +479,11 @@ def _refresh_krw_google() -> Optional[float]:
                     continue
 
         if raw_price is None:
-            m = re.search(r'"KRW"[^}]{0,80}"RUB"[^}]{0,80}(0\.\d{4,8})', html)
+            m = re.search(r'"KRW"[^}]{0,80}"RUB"[^}]{0,80}(0[\d.,]{4,8})', html)
             if not m:
-                m = re.search(r'"RUB"[^}]{0,80}"KRW"[^}]{0,80}(0\.\d{4,8})', html)
+                m = re.search(r'"RUB"[^}]{0,80}"KRW"[^}]{0,80}(0[\d.,]{4,8})', html)
             if m:
-                v = float(m.group(1))
+                v = float(m.group(1).replace(',', '.'))
                 if 0.03 < v < 0.15:
                     raw_price = v
 
@@ -622,8 +622,6 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
                 headers=auth_headers if auth_headers else None,
                 proxies=proxies,
             )
-            body_preview = r.text[:300].replace("\n", " ")
-
             if r.status_code != 200:
                 continue
 
@@ -659,7 +657,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую, чтобы обновлять курс с каждым кликом пользователя
+        # ИСПРАВЛЕНИЕ: Вызываем _refresh_krw_google напрямую для живого обновления с каждым кликом
         fg = pool.submit(_refresh_krw_google)
         fa = pool.submit(_fetch_abcex)
 
@@ -729,6 +727,7 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
 
+    # ИСПРАВЛЕНИЕ: Заменён эмодзи стрелки на круговой маркер обмена 🔄 и добавлен текст "по МСК"
     return (
         f"{T['rate_title']}\n\n"
         f"🇰🇷 <b>USDT → KRW</b>\n"
@@ -739,11 +738,11 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
         f"  🟢 {T['buy']}:   <b>{fmt_num(ab_buy_raw,  2)} ₽</b> (0-1%)\n"
         f"  🔴 {T['sell']}:  <b>{fmt_num(ab_sell_raw, 2)} ₽</b> (0-1%)\n"
         f"━━━━━━━━━━━━━━━━\n\n"
-        f"🇰🇷➡️🇷🇺 <b>KRW → RUB (кросс/Google)</b>\n"
+        f"🇰🇷🔄🇷🇺 <b>KRW → RUB (кросс/Google)</b>\n"
         f"  🟢 {T['buy']}:   {krw_line_fmt(krw_buy)}\n"
         f"  🔴 {T['sell']}:  {krw_line_fmt(krw_sell)}\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"{T['updated']} <b>{ts}</b>\n\n"
+        f"{T['updated']} <b>{ts} по МСК</b>\n\n"
         f"{T['contact']}"
     )
 
