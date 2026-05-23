@@ -1268,11 +1268,14 @@ def ping_endpoint() -> Any:
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
+        # Принудительно заставляем Telegram закрыть старые сессии пуллинга и очищаем очередь
+        bot.delete_webhook(drop_pending_updates=True)
+        time.sleep(2)
         bot.remove_webhook()
-        time.sleep(0.5)
-        logger.info("Webhook снят")
+        time.sleep(3)
+        logger.info("Успешный сброс сессий и очистка очереди обновлений")
     except Exception as exc:
-        logger.warning("remove_webhook: %s", exc)
+        logger.warning("Ошибка при очистке вехука: %s", exc)
 
     load_db()
 
