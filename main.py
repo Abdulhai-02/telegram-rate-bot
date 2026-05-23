@@ -430,10 +430,14 @@ def _refresh_krw_google() -> Optional[float]:
         r = _get_session().get(url, timeout=10)
         r.raise_for_status()
         
-        # Безопасный поиск без использования запрещенных конструкций в re
         match = re.search(r'data-last-price="([\d.]+)"', r.text)
         if not match:
             match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
+            
+        if not match:
+            js_match = re.search(r'KRW-RUB.*?([\d.]+)', r.text, re.DOTALL)
+            if js_match:
+                match = js_match
             
         if match:
             price = float(match.group(1))
@@ -487,10 +491,7 @@ def _krw_google_updater() -> None:
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """
-    Высокоуровневый разбор стакана ABCEX с автоматической конвертацией 
-    строковых массивов в типы float для исключения ошибок None.
-    """
+    """Профессиональный сбор биржевого стакана ABCEX USDTRUB с автоматической конвертацией в типы float."""
     urls = [
         "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
         "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
@@ -502,13 +503,11 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
             if r.status_code == 200:
                 d = r.json()
                 
-                # Защита: Нормализация структуры bid/ask объектов
                 if "bid" in d and "ask" in d and d["bid"] and d["ask"]:
                     b_val = d["bid"][0].get("price") if isinstance(d["bid"][0], dict) else d["bid"][0][0]
                     a_val = d["ask"][0].get("price") if isinstance(d["ask"][0], dict) else d["ask"][0][0]
                     return float(b_val), float(a_val)
                 
-                # Защита: Нормализация структуры bids/asks массивов строк
                 elif "bids" in d and "asks" in d and d["bids"] and d["asks"]:
                     bid_p = d["bids"][0]["price"] if isinstance(d["bids"][0], dict) else d["bids"][0][0]
                     ask_p = d["asks"][0]["price"] if isinstance(d["asks"][0], dict) else d["asks"][0][0]
@@ -549,7 +548,6 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
         
-    # Тотальная защита от деления на None / Ноль
     if upbit and upbit > 0 and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
     else:
@@ -1254,14 +1252,7 @@ if __name__ == "__main__":
     logger.info("🌐 Flask на порту %d", port)
 
     logger.info("🤖 Бот запущен")
-    while True:
-        try:
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=20,
-                skip_pending=True,
-                allowed_updates=["message", "callback_query"],
-            )
-        except Exception as exc:
-            logger.error("polling упал: %s — перезапуск через 10с", exc)
-            time.sleep(10)
+    
+    # Решение конфликта 409: встроенный infinity_polling сам управляет реконнектами.
+    # Убран внешний цикл while True, мешавший Render корректно гасить старый инстанс.
+    bot.infinity_polling(skip_pending=True)
