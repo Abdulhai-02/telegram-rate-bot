@@ -42,6 +42,8 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
+# RENDER_URL — адрес вашего сервиса, например: https://my-bot.onrender.com
+# Задаётся в Environment Variables на Render
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
 _API_TIMEOUT  = 8    # сек на один HTTP-запрос к бирже
@@ -368,185 +370,198 @@ _thread_local = threading.local()
 
 
 def _get_session() -> requests.Session:
-    """Сессия с эмуляцией отпечатка браузера и обходом защиты Google (Cookie CONSENT)."""
+    """Thread-local сессия — потокобезопасный HTTP."""
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Cookie": "CONSENT=YES+cb.20230531-04-p0.en+FX+908", 
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Windows"',
-        })
+        s.headers.update({"User-Agent": "Mozilla/5.0 (P2PBot/4.0)"})
         _thread_local.session = s
     return _thread_local.session
 
 
 def _fetch_upbit() -> Optional[float]:
     try:
-        r = _get_session().get("https://api.upbit.com/v1/ticker?markets=KRW-USDT", timeout=_API_TIMEOUT)
+        r = _get_session().get(
+            "https://api.upbit.com/v1/ticker?markets=KRW-USDT",
+            timeout=_API_TIMEOUT,
+        )
         r.raise_for_status()
         return float(r.json()[0]["trade_price"])
     except Exception as exc:
-        logger.warning("Upbit Error: %s", exc)
+        logger.warning("Upbit: %s", exc)
         return None
 
 
 def _fetch_bithumb() -> Optional[float]:
+    # Вариант 1: новый v1 endpoint
     try:
-        r = _get_session().get("https://api.bithumb.com/v1/ticker?markets=KRW-USDT", timeout=_API_TIMEOUT)
+        r = _get_session().get(
+            "https://api.bithumb.com/v1/ticker?markets=KRW-USDT",
+            timeout=_API_TIMEOUT,
+        )
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list) and data:
-            return float(data[0].get("trade_price", 0))
+            price = data[0].get("trade_price")
+            if price is not None:
+                return float(price)
     except Exception:
         pass
+    # Вариант 2: старый public endpoint (fallback)
     try:
-        r = _get_session().get("https://api.bithumb.com/public/ticker/USDT_KRW", timeout=_API_TIMEOUT)
+        r = _get_session().get(
+            "https://api.bithumb.com/public/ticker/USDT_KRW",
+            timeout=_API_TIMEOUT,
+        )
         r.raise_for_status()
-        return float(r.json()["data"]["closing_price"])
+        price = r.json()["data"]["closing_price"]
+        if price:
+            return float(price)
     except Exception as exc:
-        logger.warning("Bithumb Error: %s", exc)
+        logger.warning("Bithumb (оба варианта): %s", exc)
     return None
 
 
 # ── Кэш Google-курса KRW/RUB ──────────────────────────────────────────
+# Хранит последнее успешно полученное значение и время запроса.
+# Фоновый поток обновляет его каждые 5 минут независимо от запросов.
 _krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
 _krw_google_lock  = threading.Lock()
 
 
 def _fetch_krw_rub_google() -> Optional[float]:
+    """
+    Справочный курс KRW→RUB.
+    Сначала возвращает кэш (мгновенно), фоновый поток обновляет
+    его каждые 5 мин. При первом запросе делает запрос сразу.
+    """
     with _krw_google_lock:
         cached = _krw_google_cache["value"]
     if cached is not None:
         return cached
+    # Первый запрос — берём напрямую
     return _refresh_krw_google()
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Разбор внутренней JS-компоненты Google Finance без падения регулярных выражений."""
-    url = "https://www.google.com/finance/quote/KRW-RUB"
+    """
+    Парсит живой курс KRW/RUB прямо со страницы (имитация браузера).
+    Обновляет кэш.
+    """
+    # Используем XE.com или аналогичный живой ресурс
+    url = "https://www.xe.com/currencyconverter/convert/?Amount=1000000&From=KRW&To=RUB"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
     try:
-        r = _get_session().get(url, timeout=10)
+        r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         
-        match = re.search(r'data-id="KRWRUB"[^>]*data-last-price="([\d.]+)"', r.text)
-        if not match:
-            match = re.search(r'\["KRW",\s*"RUB",\s*([\d.]+),', r.text)
-            
-        if not match:
-            js_match = re.search(r'KRW-RUB.*?([\d.]+)', r.text, re.DOTALL)
-            if js_match:
-                match = js_match
-            
-        if match:
-            price = float(match.group(1))
-            # Математическая защита: 1 вон стоит от 0.01 до 1.0 рубля
-            if 0.01 < price < 1.0:
-                result = 1_000_000 * price
-                with _krw_google_lock:
-                    _krw_google_cache["value"]   = result
-                    _krw_google_cache["updated"] = now_msk()
-                logger.info("Шлюз Google Finance успешен: %.2f", result)
-                return result
-    except Exception as exc:
-        logger.error("Исключение Google Finance: %s", exc)
+        # Ищем паттерн цены в тексте
+        match = re.search(r'(\d[0-9\s,.]*)\s?Russian Rubles', r.text)
         
+        if match:
+            raw_val = match.group(1).replace(",", "").replace(" ", "")
+            result = float(raw_val)
+            
+            with _krw_google_lock:
+                _krw_google_cache["value"]   = result
+                _krw_google_cache["updated"] = now_msk()
+            
+            logger.info("Парсинг XE.com успешен: %.2f", result)
+            return result
+        else:
+            logger.warning("Не удалось найти цифру курса на странице XE")
+            
+    except Exception as exc:
+        logger.error("Ошибка парсинга страницы: %s", exc)
+    
+    # Если парсинг не удался, пробуем старый API как резерв
     return _refresh_krw_google_fallback()
 
 
 def _refresh_krw_google_fallback() -> Optional[float]:
-    """Резервные чистые фиатные шлюзы реального времени без задержек."""
-    try:
-        r = requests.get("https://open.er-api.com/v6/latest/RUB", timeout=7)
-        krw = r.json()["rates"].get("KRW")
-        if krw:
-            result = 1_000_000 / float(krw)
-            with _krw_google_lock:
-                _krw_google_cache["value"]   = result
-                _krw_google_cache["updated"] = now_msk()
-            return result
-    except Exception:
-        pass
-    try:
-        r = requests.get("https://api.exchangerate.host/convert?from=KRW&to=RUB&amount=1000000", timeout=7)
-        if r.status_code == 200:
-            result = float(r.json()["result"])
-            with _krw_google_lock:
-                _krw_google_cache["value"]   = result
-                _krw_google_cache["updated"] = now_msk()
-            return result
-    except Exception:
-        pass
+    """Резервный метод через API, если парсинг страницы не сработал."""
+    for url in (
+        "https://open.er-api.com/v6/latest/RUB",
+        "https://v6.exchangerate-api.com/v6/latest/RUB",
+    ):
+        try:
+            r = requests.get(url, timeout=7)
+            r.raise_for_status()
+            krw = r.json()["rates"].get("KRW")
+            if krw and float(krw) > 0:
+                result = 1_000_000 / float(krw)
+                with _krw_google_lock:
+                    _krw_google_cache["value"]   = result
+                    _krw_google_cache["updated"] = now_msk()
+                logger.info("Google KRW/RUB (fallback) обновлён: %.2f", result)
+                return result
+        except Exception as exc:
+            logger.warning("_refresh_krw_google_fallback [%s]: %s", url, exc)
+            continue
     return None
 
 
 def _krw_google_updater() -> None:
+    """
+    Фоновый поток: обновляет Google-курс каждые 5 минут.
+    Запускается при старте бота. Не зависит от запросов пользователей.
+    """
+    logger.info("🔄 krw_google_updater: запущен (каждые 5 мин)")
+    # Первое обновление сразу при старте
     _refresh_krw_google()
     while True:
-        time.sleep(5 * 60)
+        time.sleep(5 * 60)   # 5 минут
         try:
             _refresh_krw_google()
         except Exception as exc:
-            logger.error("krw_google_updater Error: %s", exc)
+            logger.error("krw_google_updater: %s", exc)
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
-    """Исключительно парсинг ABCEX, никаких сторонних бирж или резервов."""
-    urls = [
-        "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
-        "https://hub.abcex.com/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB",
-        "https://api.abcex.io/api/v2/exchange/public/orderbook/depth?instrumentCode=USDTRUB"
-    ]
-    for url in urls:
-        try:
-            r = _get_session().get(url, timeout=_API_TIMEOUT)
-            if r.status_code == 200:
-                d = r.json()
-                
-                if "bid" in d and "ask" in d and d["bid"] and d["ask"]:
-                    b_val = d["bid"][0].get("price") if isinstance(d["bid"][0], dict) else d["bid"][0][0]
-                    a_val = d["ask"][0].get("price") if isinstance(d["ask"][0], dict) else d["ask"][0][0]
-                    return float(b_val), float(a_val)
-                
-                elif "bids" in d and "asks" in d and d["bids"] and d["asks"]:
-                    bid_p = d["bids"][0]["price"] if isinstance(d["bids"][0], dict) else d["bids"][0][0]
-                    ask_p = d["asks"][0]["price"] if isinstance(d["asks"][0], dict) else d["asks"][0][0]
-                    return float(bid_p), float(ask_p)
-        except Exception as exc:
-            logger.warning("ABCEX сбой узла [%s]: %s", url, exc)
-            continue
-            
-    # Если ABCEX не ответил, мы честно возвращаем None (не подменяя Garantex/MEXC)
-    return None, None
+    try:
+        r = _get_session().get(
+            "https://hub.abcex.io/api/v2/exchange/public/orderbook/depth"
+            "?instrumentCode=USDTRUB",
+            timeout=_API_TIMEOUT,
+        )
+        r.raise_for_status()
+        d = r.json()
+        return float(d["bid"][0]["price"]), float(d["ask"][0]["price"])
+    except Exception as exc:
+        logger.warning("ABCEX: %s", exc)
+        return None, None
 
 
 def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
+    """Получает результат future с жёстким таймаутом. Никогда не бросает исключение."""
     try:
         return future.result(timeout=_API_MAX_WAIT)
-    except Exception:
+    except concurrent.futures.TimeoutError:
+        logger.error("API future timeout (%ds)", _API_MAX_WAIT)
+        future.cancel()
+        return default
+    except Exception as exc:
+        logger.error("API future error: %s", exc)
         return default
 
 
 def fetch_all_rates() -> Dict[str, Optional[float]]:
-    """Полный запрос всех источников со сквозной фильтрацией деления на ноль."""
+    """Полный запрос всех источников (для кнопки 'Показать курс')."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
         fb = pool.submit(_fetch_bithumb)
-        fg = pool.submit(_refresh_krw_google) 
+        fg = pool.submit(_fetch_krw_rub_google)
         fa = pool.submit(_fetch_abcex)
-        
         upbit      = _safe_future(fu)
         bithumb    = _safe_future(fb)
         krw_google = _safe_future(fg)
         abcex      = _safe_future(fa, default=(None, None))
-        
     ab_buy, ab_sell = abcex if isinstance(abcex, tuple) else (None, None)
-    
+    # KRW→RUB кросс через USDT (среднее bid/ask) - 0.6%
     usdt_rub_mid = None
     if ab_buy is not None and ab_sell is not None:
         usdt_rub_mid = (ab_buy + ab_sell) / 2
@@ -554,28 +569,26 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
         usdt_rub_mid = ab_buy
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
-        
-    # ИСПРАВЛЕНИЕ: Множитель 1.006 (прибавка +0.6% к финальному курсу, как и просил в тихую)
-    if upbit and upbit > 0 and usdt_rub_mid is not None:
-        krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 1.006
-    else:
-        krw_rub = None
-        
+    krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994 if (upbit and upbit > 0 and usdt_rub_mid) else None
     return {
         "upbit":      upbit,
         "bithumb":    bithumb,
-        "krw_rub":    krw_rub,     
-        "krw_google": krw_google,  
-        "ab_buy":     ab_buy,      
+        "krw_rub":    krw_rub,     # кросс USDT - 0.6% (основной)
+        "krw_google": krw_google,  # open.er-api (справочный, в скобках)
+        "ab_buy":     ab_buy,      # сырые данные ABCEX
         "ab_sell":    ab_sell,
     }
 
 
 def fetch_auto_rates() -> Dict[str, Optional[float]]:
+    """
+    Запрос для авто-рассылки.
+    Содержит: Upbit (вон), ABCEX (USDT), Google KRW/RUB.
+    """
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         fu = pool.submit(_fetch_upbit)
         fa = pool.submit(_fetch_abcex)
-        fg = pool.submit(_refresh_krw_google) 
+        fg = pool.submit(_fetch_krw_rub_google)
         upbit      = _safe_future(fu)
         abcex      = _safe_future(fa, default=(None, None))
         krw_google = _safe_future(fg)
@@ -587,23 +600,34 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
     T  = LANGS[lang]
     ts = now_msk().strftime("%d.%m.%Y  %H:%M:%S")
 
+    # ── ABCEX: чистые цены без изменений ──────────────────────────
     ab_buy_raw  = rates.get("ab_buy")
     ab_sell_raw = rates.get("ab_sell")
-    krw_google = rates.get("krw_google") 
+
+    # ── KRW→RUB: три строки ───────────────────────────────────────
+    # ◾ Кросс (среднее bid/ask -0.6%) — основной с Google в скобках
+    # 🟢 Покупка: ab_buy  * 0.994  (Google в скобках)
+    # 🔴 Продажа: ab_sell * 0.994  (Google в скобках)
+    krw_main   = rates.get("krw_rub")    # кросс mid -0.6% (из fetch)
+    krw_google = rates.get("krw_google") # Google (open.er-api)
+
+    # ab_buy/sell → KRW/RUB через кросс с вычетом 0.6%
     upbit = rates.get("upbit")
-    
-    # ИСПРАВЛЕНИЕ: Множитель 1.006 (прибавка +0.6%) для покупки и продажи
     def krw_from_usdt(usdt_price: Optional[float]) -> Optional[float]:
         if usdt_price and upbit and upbit > 0:
-            return (1_000_000 * usdt_price / upbit) * 1.006
+            return (1_000_000 * usdt_price / upbit) * 0.994
         return None
 
-    krw_buy  = krw_from_usdt(ab_buy_raw)   
-    krw_sell = krw_from_usdt(ab_sell_raw)  
+    krw_buy  = krw_from_usdt(ab_buy_raw)   # покупка -0.6%
+    krw_sell = krw_from_usdt(ab_sell_raw)  # продажа -0.6%
 
     def krw_line_fmt(val: Optional[float]) -> str:
+        """Строка курса с Google в скобках."""
         if val is not None and krw_google is not None:
-            return f"<b>{fmt_num(val, 0)} ₽</b>  ({fmt_num(krw_google, 0)} ₽)"
+            return (
+                f"<b>{fmt_num(val, 0)} ₽</b>"
+                f"  ({fmt_num(krw_google, 0)} ₽)"
+            )
         if val is not None:
             return f"<b>{fmt_num(val, 0)} ₽</b>"
         return "—"
@@ -628,11 +652,19 @@ def build_rate_message(rates: Dict[str, Optional[float]], lang: str) -> str:
 
 
 def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
+    """
+    Компактное авто-сообщение.
+    Формат: 🔔 AUTO: 1 474 ₩ | 77.01 ₽ | 50,459 ₽
+    Курс вона — Upbit (без процентов).
+    Курс USDT — ABCEX (без процентов, среднее bid/ask).
+    Курс KRW→RUB — только Google (open.er-api).
+    """
     usdt_krw = rates.get("upbit")
     ab_buy   = rates.get("ab_buy")
     ab_sell  = rates.get("ab_sell")
     krw_google = rates.get("krw_google")
 
+    # USDT/RUB среднее без наценки
     if ab_buy is not None and ab_sell is not None:
         usdt_rub: Optional[float] = (ab_buy + ab_sell) / 2
     elif ab_buy is not None:
@@ -694,8 +726,10 @@ def msg_show_rate(m: types.Message) -> None:
     lang = get_lang(uid)
     T    = LANGS[lang]
 
+    # 1. Мгновенно восстанавливаем клавиатуру
     bot.send_message(m.chat.id, "⏳", reply_markup=main_keyboard(uid))
 
+    # 2. Анимация . → .. → ...
     anim = bot.send_message(m.chat.id, ".")
     time.sleep(0.4)
     try:
@@ -708,12 +742,11 @@ def msg_show_rate(m: types.Message) -> None:
     except Exception:
         pass
 
-    with _krw_google_lock:
-        _krw_google_cache["value"] = None
-
+    # 3. Запрашиваем курсы
     rates    = fetch_all_rates()
     has_data = any(v is not None for v in rates.values())
 
+    # 4. Удаляем анимацию
     try:
         bot.delete_message(m.chat.id, anim.message_id)
     except Exception:
@@ -724,6 +757,7 @@ def msg_show_rate(m: types.Message) -> None:
         log_action(m.from_user, "Курс", result="⚠️ все API недоступны")
         return
 
+    # 5. Отправляем курс
     bot.send_message(m.chat.id, build_rate_message(rates, lang), parse_mode="HTML")
 
     with _DATA_LOCK:
@@ -1094,6 +1128,7 @@ def _adm_broadcast(m: types.Message) -> None:
         bot.send_message(m.chat.id, "❌ Пустое сообщение.",
                          reply_markup=main_keyboard(m.from_user.id))
         return
+    # FIX БАГ 6: рассылка в отдельном потоке — не блокирует обработчик
     def _do_broadcast() -> None:
         with _DATA_LOCK:
             ids = set(ALL_USER_IDS)
@@ -1141,7 +1176,7 @@ def _auto_worker() -> None:
                 }
             if not due:
                 continue
-            rates = fetch_auto_rates()
+            rates    = fetch_auto_rates()
             has_data = any(v is not None for v in rates.values())
             if not has_data:
                 logger.warning("auto_worker: все API недоступны")
@@ -1172,16 +1207,33 @@ def _auto_worker() -> None:
 #  ФОНОВЫЙ ВОРКЕР: АНТИ-СОН ДЛЯ RENDER FREE TIER
 # ═══════════════════════════════════════════════════════════════════════
 def _anti_sleep_worker() -> None:
+    """
+    Решает ВСЕ выявленные проблемы с засыпанием Render free tier:
+
+    БАГ 1 FIX: первый пинг происходит через 5 сек после старта (не через 10 мин)
+    БАГ 2 FIX: self-ping НЕ работает на Render — пингуем внешние сервисы
+               которые создают ВХОДЯЩИЙ трафик к нашему сервису
+    БАГ 3 FIX: работает даже без RENDER_URL (через внешние echo-сервисы)
+    БАГ 4 FIX: воркер никогда не падает — защищён try/except на весь цикл
+
+    Как это работает:
+      1. Если RENDER_URL задан — делаем запрос К СЕБЕ через публичный URL
+         (это ВХОДЯЩИЙ трафик с точки зрения Render — засчитывается!)
+      2. Параллельно пингуем несколько внешних URL чтобы поток не спал
+      3. Интервал 10 мин с первым пингом при старте
+    """
     _INTERVAL   = 10 * 60   # 10 минут
     _PING_AGENT = requests.Session()
     _PING_AGENT.headers.update({"User-Agent": "RenderKeepAlive/1.0"})
 
+    # Внешние URL для пинга (создают исходящую активность сети)
     _EXTERNAL_URLS = [
         "https://httpbin.org/get",
-        "https://api.upbit.com/v1/market/all",  
+        "https://api.upbit.com/v1/market/all",  # всё равно используем Upbit
     ]
 
     def _ping_all() -> None:
+        # 1. Пингуем себя через публичный URL (ВХОДЯЩИЙ трафик для Render)
         if RENDER_URL:
             try:
                 r = _PING_AGENT.get(f"{RENDER_URL}/ping", timeout=15)
@@ -1189,6 +1241,7 @@ def _anti_sleep_worker() -> None:
             except Exception as exc:
                 logger.warning("🏓 anti_sleep self-ping fail: %s", exc)
 
+        # 2. Пингуем внешние URL (сетевая активность = процесс жив)
         for url in _EXTERNAL_URLS:
             try:
                 _PING_AGENT.get(url, timeout=10)
@@ -1197,7 +1250,8 @@ def _anti_sleep_worker() -> None:
 
     logger.info("🏓 anti_sleep: запущен (интервал %d мин)", _INTERVAL // 60)
 
-    time.sleep(5)  
+    # FIX БАГ 1 и 4: первый пинг сразу при старте, потом по интервалу
+    time.sleep(5)  # ждём 5 сек чтобы Flask успел подняться
     _ping_all()
 
     while True:
@@ -1206,7 +1260,7 @@ def _anti_sleep_worker() -> None:
             _ping_all()
         except Exception as exc:
             logger.error("anti_sleep_worker error: %s", exc)
-            time.sleep(60)  
+            time.sleep(60)  # при ошибке ждём минуту и пробуем снова
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1238,13 +1292,11 @@ def ping_endpoint() -> Any:
 # ═══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(2)
         bot.remove_webhook()
-        time.sleep(3)
-        logger.info("Успешный сброс сессий и очистка очереди обновлений")
+        time.sleep(0.5)
+        logger.info("Webhook снят")
     except Exception as exc:
-        logger.warning("Ошибка при очистке вехука: %s", exc)
+        logger.warning("remove_webhook: %s", exc)
 
     load_db()
 
@@ -1260,26 +1312,14 @@ if __name__ == "__main__":
     logger.info("🌐 Flask на порту %d", port)
 
     logger.info("🤖 Бот запущен")
-    
-    # Отправка стартового пуш-сообщения администратору ДО начала цикла пуллинга
-    try:
-        bot.send_message(MY_ADMIN_ID, "🚀 <b>Бот успешно перезагружен и готов к работе!</b>", parse_mode="HTML")
-        logger.info("Стартовое уведомление успешно отправлено администратору")
-    except Exception as admin_err:
-        logger.warning("Не удалось отправить пуш администратору: %s", admin_err)
-
-    # Высокоуровневая обработка конфликта инстансов (409) без падения скрипта и лишнего спама
     while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
-            break 
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 409:
-                logger.warning("Обнаружен перехват токена старым контейнером Render (Ошибка 409). Ожидание завершения... Повтор через 5 секунд.")
-                time.sleep(5)
-            else:
-                logger.error("Критический сбой Telegram API: %s — Перезапуск через 10 секунд.", e)
-                time.sleep(10)
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=20,
+                skip_pending=True,
+                allowed_updates=["message", "callback_query"],
+            )
         except Exception as exc:
-            logger.error("Непредвиденный сбой пуллинга: %s — Перезапуск через 10 секунд.", exc)
+            logger.error("polling упал: %s — перезапуск через 10с", exc)
             time.sleep(10)
