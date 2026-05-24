@@ -507,6 +507,7 @@ def _refresh_krw_google() -> Optional[float]:
     try:
         url_rub_krw = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&gl=us&_ts={int(time.time())}"
         r = session.get(url_rub_krw, timeout=10)
+        logger.info("Google HTTP %d | body[:500]: %s", r.status_code, r.text[:500])
         if r.status_code == 200:
             html = r.text
 
