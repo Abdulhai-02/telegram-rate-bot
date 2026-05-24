@@ -486,7 +486,6 @@ def _refresh_krw_google() -> Optional[float]:
         logger.info("[%s] KRW→RUB сохранён: %.0f ₽/млн KRW", src, val)
         return val
 
-    # Настройка прокси для пробития облачного бана Render
     proxies = {"http": ABCEX_PROXY, "https": ABCEX_PROXY} if ABCEX_PROXY else None
 
     # ── ВАЛ 1: XE.com Прямой калькулятор 1 000 000 KRW в RUB ──
@@ -496,14 +495,12 @@ def _refresh_krw_google() -> Optional[float]:
         if r.status_code == 200:
             html = r.text
             
-            # Потоковый фильтр цифр: ищем в коде значения, проходящие жесткие границы рынка воны за миллион
             candidates = re.findall(r'([\d.,\s]{5,12})(?:\s*Рублей|\s*Russian|\s*RUB|<)', html, re.IGNORECASE)
             for c in candidates:
                 v = _clean_and_parse(c)
                 if v and 35000 < v < 85000:
                     return _save_cache(v, "XE.com Калькулятор")
                     
-            # Дополнительное сканирование параграфов конвертера
             m = re.search(r'class="[^"]*sc-[^"]*"[^>]*>([\d.,\s]+)<span>', html)
             if m:
                 v = _clean_and_parse(m.group(1))
@@ -670,6 +667,7 @@ def _safe_future(future: concurrent.futures.Future, default: Any = None) -> Any:
         return default
 
 
+# ИСПРАВЛЕНО: Лишнее слово "Useful" полностью удалено из условия проверки переменных
 def fetch_all_rates() -> Dict[str, Optional[float]]:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         fu = pool.submit(_fetch_upbit)
@@ -692,7 +690,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
 
-    if upbit and upbit > 0 Useful and usdt_rub_mid is not None:
+    if upbit and upbit > 0 and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
     else:
         krw_rub = None
@@ -837,7 +835,6 @@ def msg_show_rate(m: types.Message) -> None:
     try: bot.edit_message_text("...", m.chat.id, anim.message_id)
     except Exception: pass
 
-    # ПРИНУДИТЕЛЬНЫЙ ФОРС-СБРОС КЭША ПРИ РУЧНОМ КЛИКЕ КНОПКИ ПОЛЬЗОВАТЕЛЕМ
     with _krw_google_lock:
         _krw_google_cache["value"] = None
 
@@ -1348,7 +1345,7 @@ def _notify_startup() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  FLASK
+#  ЗАПУСК СЕРВЕРА
 # ═══════════════════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 
@@ -1397,17 +1394,6 @@ def telegram_webhook() -> Any:
 
     threading.Thread(target=lambda: bot.process_new_updates([update]), daemon=True).start()
     return "", 200
-
-
-def _polling_fallback() -> None:
-    logger.warning("⚠️ Запуск в режиме polling (только для локальной отладки)")
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
-            break
-        except Exception as exc:
-            logger.error("Polling crashed: %s — повтор через 10 сек", exc)
-            time.sleep(10)
 
 
 if __name__ == "__main__":
