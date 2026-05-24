@@ -1,9 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-P2P Exchange Rate Telegram Bot
-Production-grade: thread-safe, Render-ready, MongoDB-backed.
-"""
-
 import os
 import logging
 import threading
@@ -43,18 +37,13 @@ MY_ADMIN_ID: int       = 5266659205
 ADMIN_LOG_CHAT_ID: int = -1003264764082
 MOSCOW_TZ              = timezone(timedelta(hours=3))
 
-# RENDER_URL — публичный URL сервиса во Франкфурте (без слеша на конце)
 RENDER_URL: str = os.getenv("RENDER_URL", "").rstrip("/")
 
-# Опциональные ENV для ABCEX
 ABCEX_API_KEY:    str = os.getenv("ABCEX_API_KEY", "").strip()
 ABCEX_API_SECRET: str = os.getenv("ABCEX_API_SECRET", "").strip()
 ABCEX_PROXY:      str = os.getenv("ABCEX_PROXY", "").strip()
 
-# Секретный токен для проверки запросов от Telegram (X-Telegram-Bot-Api-Secret-Token).
 WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip() or secrets.token_urlsafe(32)
-
-# Путь webhook — защищен токеном бота
 WEBHOOK_PATH: str = f"/webhook/{TELEGRAM_TOKEN}"
 
 _API_TIMEOUT  = 8
@@ -138,7 +127,7 @@ LANGS: Dict[str, Dict[str, str]] = {
         "error_fetch":  "⚠️ Failed to get data. Please try again later.",
         "rate_title":   "💱 <b>CURRENT RATES</b>",
         "updated":      "⏱ Updated:",
-        "contact":      "💰 Exchange of any amounts — by agreement.\n📞 Contact: @Abdulkhaiii",
+        "contact":      "💰 Exchange of any amounts — by agreement.\n�360 Contact: @Abdulkhaiii",
         "auto_menu":    "Select update frequency:",
         "auto_choose":  "⬇️ Choose interval:",
         "auto_off_msg": "Auto-updates disabled.",
@@ -165,10 +154,6 @@ ALL_USER_IDS: set                       = set()
 
 _krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
 _krw_google_lock  = threading.Lock()
-
-# ── ИСПРАВЛЕНИЕ: флаг дедупликации in-flight запросов ─────────────────
-# Если один поток уже идёт за данными в Google, остальные ждут его
-# результата вместо того, чтобы запускать дублирующий HTTP-запрос.
 _krw_google_refreshing = threading.Event()
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -396,9 +381,8 @@ def _get_session() -> requests.Session:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Cookie": "SOCS=CAISHAgBEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjYwMTAxLjAxX3AxGgVydS1SVSgB; CONSENT=YES+cb.20260101-00-p0.ru+FX+999; AEC=AVYB7coM1X",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
         })
@@ -433,56 +417,30 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
-# ── Google Finance: потокобезопасный кеш с дедупликацией ──────────────
+# ── Google: потокобезопасный кеш с дедупликацией ──────────────────────
 
 def _fetch_krw_rub_google() -> Optional[float]:
-    """
-    Потокобезопасный шлюз кеша Google Finance.
-
-    ИСПРАВЛЕНО (3 проблемы оригинала):
-
-    1. Race condition — оригинал захватывал _krw_google_lock дважды
-       (отдельно для чтения и отдельно для записи в _save_cache), из-за чего
-       несколько потоков одновременно проходили проверку «кеш свежий?» с
-       результатом False и запускали дублирующие HTTP-запросы к Google.
-       → Теперь чтение атомарно (один захват блокировки).
-
-    2. Нет дедупликации in-flight запросов — ThreadPoolExecutor в
-       fetch_all_rates() и fetch_auto_rates() запускал эту функцию
-       параллельно, и каждый поток мог начать свой HTTP-запрос.
-       → Флаг _krw_google_refreshing (threading.Event) гарантирует, что
-         второй поток ждёт завершения первого и берёт готовый результат.
-
-    3. При сбое возвращался None вместо устаревшего кеша — даже если
-       минуту назад был рабочий курс, пользователь видел «—».
-       → При неудаче возвращаем последнее известное значение кеша.
-    """
-    # Атомарное чтение под одной блокировкой
+    """Потокобезопасный шлюз кеша с дедупликацией in-flight запросов."""
     with _krw_google_lock:
         cached  = _krw_google_cache["value"]
         updated = _krw_google_cache["updated"]
 
-    # Кеш свежий (< 10 минут) — возвращаем без лишних блокировок
     if cached is not None and updated is not None:
         if _elapsed_sec(updated) < 600:
             return cached
 
-    # Другой поток уже обновляет — ждём его (max 15 сек) и берём результат
     if _krw_google_refreshing.is_set():
         logger.debug("_fetch_krw_rub_google: ожидание in-flight запроса")
         _krw_google_refreshing.wait(timeout=15)
         with _krw_google_lock:
             return _krw_google_cache["value"]
 
-    # Мы первые — поднимаем флаг и идём за свежими данными
     _krw_google_refreshing.set()
     try:
         result = _refresh_krw_google()
     finally:
-        # Флаг снимается в любом случае (успех или исключение)
         _krw_google_refreshing.clear()
 
-    # Если все источники упали — вернуть устаревший кеш лучше, чем None
     if result is None:
         with _krw_google_lock:
             stale = _krw_google_cache["value"]
@@ -494,73 +452,121 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Двухвальный каскадный парсер ядра Google Finance с принудительным US-позиционированием (Bypass Consent Wall)."""
+    """
+    Парсинг курса KRW/RUB через Google Search.
+    Google Finance перешёл на React SPA (FinHubUi) — данные больше не рендерятся
+    в статическом HTML. Google Search всё ещё отдаёт конвертер валют в HTML.
+    """
     session = _get_session()
 
-    def _save_cache(val: float) -> float:
+    def _save_cache(val: float, src: str) -> float:
         with _krw_google_lock:
             _krw_google_cache["value"]   = val
             _krw_google_cache["updated"] = now_msk()
+        logger.info("[%s] KRW→RUB сохранён: %.0f ₽/млн KRW", src, val)
         return val
 
-    # ─── ВАЛ 1: Твоя классическая схема RUB-KRW (1 000 000 / v) с gl=us флагом ───
-    try:
-        url_rub_krw = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&gl=us&_ts={int(time.time())}"
-        r = session.get(url_rub_krw, timeout=10)
-        logger.info("Google HTTP %d | URL: %s | body[:500]: %s", r.status_code, url_rub_krw, r.text[:500])
-        if r.status_code == 200:
+    # ── ВАЛ 1: Google Search — конвертер "1000000 RUB to KRW" ────────
+    search_urls = [
+        f"https://www.google.com/search?q=1000000+RUB+to+KRW&hl=en&gl=us&_ts={int(time.time())}",
+        f"https://www.google.com/search?q=RUB+KRW&hl=en&gl=us&_ts={int(time.time())}",
+    ]
+    for url in search_urls:
+        try:
+            r = session.get(url, timeout=10)
+            logger.info("Google/Search HTTP %d | body[:400]: %s", r.status_code, r.text[:400])
+            if r.status_code != 200:
+                continue
             html = r.text
 
-            # 1. Поиск по глобальному поисковому метатегу
-            m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
+            # Паттерн А: data-value в конвертере (результат запроса "X RUB to KRW")
+            # Google показывает результат как "= N KRW", нам нужно N
+            m = re.search(r'data-value="([0-9]+(?:\.[0-9]+)?)"', html)
             if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v)
+                v = float(m.group(1))
+                # v = сколько KRW за 1 000 000 RUB
+                if v > 100_000:
+                    result = 1_000_000 / v * 1_000_000
+                    if 30_000 < result < 120_000:
+                        return _save_cache(result, "Google/Search data-value")
 
-            # 2. Поиск во внутреннем JSON-массиве данных скрипта
-            m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
+            # Паттерн Б: span.DFlfde или span.MWvIVe — итоговое число конвертера
+            for cls in ("DFlfde", "MWvIVe", "SwHCTb", "a61j6"):
+                m = re.search(rf'class="[^"]*{cls}[^"]*"[^>]*>([0-9][0-9 ,.]+)', html)
+                if m:
+                    raw = m.group(1).replace(',', '').replace(' ', '').replace('\xa0', '')
+                    try:
+                        v = float(raw)
+                        if v > 100_000:
+                            result = 1_000_000 / v * 1_000_000
+                            if 30_000 < result < 120_000:
+                                return _save_cache(result, f"Google/Search {cls}")
+                    except ValueError:
+                        continue
+
+            # Паттерн В: прямой поиск числа рядом с "KRW" или "South Korean won"
+            m = re.search(
+                r'([0-9]{6,12}(?:[.,][0-9]+)?)\s*(?:South Korean won|KRW)',
+                html, re.IGNORECASE
+            )
             if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v)
-
-            # 3. Парсинг по классам верстки
-            container_matches = re.findall(r'class="[^"]*(?:fxKbKc|YMlKec)[^"]*"[^>]*>([^<]+)<', html)
-            for c in container_matches:
-                clean_str = c.replace(',', '.').replace(' ', '').replace('\xa0', '').strip()
-                clean_str = re.sub(r'[^\d.]', '', clean_str)
-                if not clean_str: continue
+                raw = m.group(1).replace(',', '').replace(' ', '')
                 try:
-                    v = float(clean_str)
-                    if 10.0 < v < 25.0:
-                        return _save_cache(1_000_000 / v)
-                except ValueError: continue
-    except Exception as e:
-        logger.debug("Ошибка Вала 1 (RUB-KRW): %s", e)
+                    v = float(raw)
+                    if v > 100_000:
+                        result = 1_000_000 / v * 1_000_000
+                        if 30_000 < result < 120_000:
+                            return _save_cache(result, "Google/Search KRW-context")
+                except ValueError:
+                    pass
 
-    # ─── ВАЛ 2: Резервный кросс-поиск пары KRW-RUB (1 000 000 * v) с gl=us флагом ───
+            # Паттерн Г: обратный — сколько RUB за 1 KRW (запрос "RUB KRW")
+            m = re.search(
+                r'([0-9]+\.[0-9]{2,6})\s*(?:Russian ruble|RUB)',
+                html, re.IGNORECASE
+            )
+            if m:
+                try:
+                    v = float(m.group(1))
+                    if 0.03 < v < 0.15:
+                        return _save_cache(1_000_000 * v, "Google/Search RUB-context")
+                except ValueError:
+                    pass
+
+        except Exception as e:
+            logger.warning("Google/Search ошибка (%s): %s", url, e)
+
+    # ── ВАЛ 2: Google Finance (на случай если они вернут статический рендер) ──
     try:
-        url_krw_rub = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&gl=us&_ts={int(time.time())}"
-        r = session.get(url_krw_rub, timeout=10)
+        url_f = f"https://www.google.com/finance/quote/KRW-RUB?hl=en&gl=us&_ts={int(time.time())}"
+        r = session.get(url_f, timeout=10)
+        logger.info("Google/Finance HTTP %d | body[:400]: %s", r.status_code, r.text[:400])
         if r.status_code == 200:
             html = r.text
-
-            m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
+            m = (re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or
+                 re.search(r'content="([\d.,]+)"\s+itemprop="price"', html))
             if m:
                 v = float(m.group(1).replace(',', '.'))
-                if 0.035 < v < 0.085:
-                    return _save_cache(1_000_000 * v)
-
-            m = re.search(r'\[\s*["\']KRW["\']\s*,\s*["\']RUB["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
-            if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 0.035 < v < 0.085:
-                    return _save_cache(1_000_000 * v)
+                if 0.03 < v < 0.15:
+                    return _save_cache(1_000_000 * v, "Google/Finance itemprop")
+            for cls in ("YMlKec", "fxKbKc"):
+                matches = re.findall(
+                    rf'class="[^"]*{cls}[^"]*"[^>]*>([^<]+)<', html
+                )
+                for c in matches:
+                    raw = re.sub(r'[^\d.]', '', c.replace(',', '.').strip())
+                    if not raw:
+                        continue
+                    try:
+                        v = float(raw)
+                        if 0.03 < v < 0.15:
+                            return _save_cache(1_000_000 * v, f"Google/Finance {cls}")
+                    except ValueError:
+                        continue
     except Exception as e:
-        logger.debug("Ошибка Вала 2 (KRW-RUB): %s", e)
+        logger.warning("Google/Finance вал 2 ошибка: %s", e)
 
-    logger.warning("[Google/Finance] Прямые структуры недоступны. Запуск резервного API шлюза.")
+    logger.warning("[Google] Все валы недоступны. Запуск резервного шлюза.")
     return _refresh_krw_google_fallback()
 
 
@@ -614,24 +620,7 @@ def _refresh_krw_google_fallback() -> Optional[float]:
 
 
 def _krw_google_updater() -> None:
-    """
-    Фоновый воркер обновления курса KRW/Google.
-
-    ИСПРАВЛЕНО (2 проблемы оригинала):
-
-    1. Оригинал делал первый _refresh_krw_google() напрямую, минуя
-       _fetch_krw_rub_google() — то есть без механизма дедупликации.
-       При одновременном старте воркера и пользовательского запроса
-       оба потока уходили в HTTP одновременно.
-       → Теперь воркер вызывает _fetch_krw_rub_google(), который сам
-         управляет флагом и не допускает дублей.
-
-    2. При сбое (Google вернул 429 или парсинг не прошёл) оригинал
-       просто спал 10 минут и снова пробовал — без backoff.
-       При серии сбоев это давало 6 запросов в час на заблокированный IP.
-       → Экспоненциальный backoff: 30 с → 60 → 120 → ... → 600 с.
-         При успехе backoff сбрасывается на 30 с.
-    """
+    """Фоновый воркер с экспоненциальным backoff при сбоях."""
     logger.info("krw_google_updater: запущен")
     backoff = 30
     while True:
@@ -639,8 +628,8 @@ def _krw_google_updater() -> None:
             result = _fetch_krw_rub_google()
             if result is not None:
                 logger.info("krw_google_updater: %.0f ₽/млн KRW", result)
-                backoff = 30          # сброс backoff при успехе
-                time.sleep(10 * 60)  # стандартный интервал 10 минут
+                backoff = 30
+                time.sleep(10 * 60)
             else:
                 logger.warning("krw_google_updater: все источники вернули None, backoff=%ds", backoff)
                 time.sleep(backoff)
@@ -662,7 +651,7 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
 
     auth_headers: Dict[str, str] = {}
     if ABCEX_API_KEY:
-        auth_headers["X-API-KEY"]   = ABCEX_API_KEY
+        auth_headers["X-API-KEY"]    = ABCEX_API_KEY
         auth_headers["Authorization"] = f"Bearer {ABCEX_API_KEY}"
 
     proxies = {"http": ABCEX_PROXY, "https": ABCEX_PROXY} if ABCEX_PROXY else None
@@ -711,21 +700,16 @@ def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
             )
             if r.status_code != 200:
                 continue
-
             try: d = r.json()
             except ValueError: continue
-
             bids, asks = _extract_side(d, BID_KEYS, ASK_KEYS)
             if not bids or not asks:
                 continue
-
             b_price = _extract_price(bids[0])
             a_price = _extract_price(asks[0])
-
             if b_price and a_price and b_price > 0 and a_price > 0:
                 logger.info("[ABCEX] ✅ bid=%.2f ask=%.2f ← %s", b_price, a_price, url)
                 return float(b_price), float(a_price)
-
         except Exception as e:
             logger.error("[ABCEX] Ошибка %s: %s", url, e)
             continue
@@ -847,9 +831,9 @@ def build_auto_message(rates: Dict[str, Optional[float]]) -> str:
     else:
         usdt_rub = None
 
-    part_krw     = f"{fmt_num(usdt_krw, 0)} ₩"        if usdt_krw   is not None else "— ₩"
-    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"         if usdt_rub   is not None else "— ₽"
-    part_krw_rub = f"{fmt_num(krw_google, 0)} ₽"       if krw_google is not None else "— ₽"
+    part_krw     = f"{fmt_num(usdt_krw, 0)} ₩"  if usdt_krw   is not None else "— ₩"
+    part_rub     = f"{fmt_num(usdt_rub, 2)} ₽"   if usdt_rub   is not None else "— ₽"
+    part_krw_rub = f"{fmt_num(krw_google, 0)} ₽" if krw_google is not None else "— ₽"
     return f"🔔 AUTO: {part_krw} | {part_rub} | {part_krw_rub}"
 
 
@@ -1074,7 +1058,7 @@ def msg_admin_panel(m: types.Message) -> None:
     kb.add(
         types.InlineKeyboardButton("📊 Статистика",              callback_data="adm_stat"),
         types.InlineKeyboardButton("👥 База пользователей",      callback_data="adm_users_0"),
-        types.InlineKeyboardButton("📢 Рассылка всем",          callback_data="adm_bc"),
+        types.InlineKeyboardButton("📢 Рассылка всем",           callback_data="adm_bc"),
         types.InlineKeyboardButton("🔔 Упр. подписками (тихо)", callback_data="adm_auto_menu"),
     )
     bot.send_message(m.chat.id, "🛠 <b>Админ-панель</b>", reply_markup=kb)
@@ -1429,6 +1413,11 @@ def health() -> Any:
         "users":  n_u,
         "subs":   n_s,
         "time":   now_msk().strftime("%Y-%m-%d %H:%M:%S MSK"),
+        "krw_google_cache": {
+            "value":   _krw_google_cache["value"],
+            "updated": _krw_google_cache["updated"].isoformat() if _krw_google_cache["updated"] else None,
+            "age_sec": _elapsed_sec(_krw_google_cache["updated"]),
+        },
     }), 200
 
 
@@ -1460,24 +1449,17 @@ def telegram_webhook() -> Any:
 
 
 if __name__ == "__main__":
-    # 1. Захват токена у старого инстанса
     _force_takeover_token()
-
-    # 2. Загрузка БД
     load_db()
 
-    # 3. Фоновые воркеры
     threading.Thread(target=_auto_worker,        daemon=True, name="auto_worker").start()
     threading.Thread(target=_anti_sleep_worker,  daemon=True, name="anti_sleep").start()
     threading.Thread(target=_krw_google_updater, daemon=True, name="krw_google").start()
 
-    # 4. Регистрация вебхука
     webhook_ok = _setup_webhook()
 
-    # 5. Пуш уведомления в лог-канал
     threading.Thread(target=_notify_startup, daemon=True).start()
 
-    # 6. Запуск сервера Flask
     port = int(os.environ.get("PORT", 10_000))
 
     if webhook_ok:
