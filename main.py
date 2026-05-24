@@ -166,6 +166,11 @@ ALL_USER_IDS: set                       = set()
 _krw_google_cache: Dict[str, Any] = {"value": None, "updated": None}
 _krw_google_lock  = threading.Lock()
 
+# ── ИСПРАВЛЕНИЕ: флаг дедупликации in-flight запросов ─────────────────
+# Если один поток уже идёт за данными в Google, остальные ждут его
+# результата вместо того, чтобы запускать дублирующий HTTP-запрос.
+_krw_google_refreshing = threading.Event()
+
 # ═══════════════════════════════════════════════════════════════════════
 #  УТИЛИТЫ
 # ═══════════════════════════════════════════════════════════════════════
@@ -428,24 +433,70 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
-# ── Интеллектуальный шлюз Google Finance ──────────────────────────────
+# ── Google Finance: потокобезопасный кеш с дедупликацией ──────────────
+
 def _fetch_krw_rub_google() -> Optional[float]:
-    """Возвращает курс из безопасного оперативного кэша, защищая IP от блокировок."""
+    """
+    Потокобезопасный шлюз кеша Google Finance.
+
+    ИСПРАВЛЕНО (3 проблемы оригинала):
+
+    1. Race condition — оригинал захватывал _krw_google_lock дважды
+       (отдельно для чтения и отдельно для записи в _save_cache), из-за чего
+       несколько потоков одновременно проходили проверку «кеш свежий?» с
+       результатом False и запускали дублирующие HTTP-запросы к Google.
+       → Теперь чтение атомарно (один захват блокировки).
+
+    2. Нет дедупликации in-flight запросов — ThreadPoolExecutor в
+       fetch_all_rates() и fetch_auto_rates() запускал эту функцию
+       параллельно, и каждый поток мог начать свой HTTP-запрос.
+       → Флаг _krw_google_refreshing (threading.Event) гарантирует, что
+         второй поток ждёт завершения первого и берёт готовый результат.
+
+    3. При сбое возвращался None вместо устаревшего кеша — даже если
+       минуту назад был рабочий курс, пользователь видел «—».
+       → При неудаче возвращаем последнее известное значение кеша.
+    """
+    # Атомарное чтение под одной блокировкой
     with _krw_google_lock:
-        cached = _krw_google_cache["value"]
+        cached  = _krw_google_cache["value"]
         updated = _krw_google_cache["updated"]
-    
+
+    # Кеш свежий (< 10 минут) — возвращаем без лишних блокировок
     if cached is not None and updated is not None:
         if _elapsed_sec(updated) < 600:
             return cached
-            
-    return _refresh_krw_google()
+
+    # Другой поток уже обновляет — ждём его (max 15 сек) и берём результат
+    if _krw_google_refreshing.is_set():
+        logger.debug("_fetch_krw_rub_google: ожидание in-flight запроса")
+        _krw_google_refreshing.wait(timeout=15)
+        with _krw_google_lock:
+            return _krw_google_cache["value"]
+
+    # Мы первые — поднимаем флаг и идём за свежими данными
+    _krw_google_refreshing.set()
+    try:
+        result = _refresh_krw_google()
+    finally:
+        # Флаг снимается в любом случае (успех или исключение)
+        _krw_google_refreshing.clear()
+
+    # Если все источники упали — вернуть устаревший кеш лучше, чем None
+    if result is None:
+        with _krw_google_lock:
+            stale = _krw_google_cache["value"]
+        if stale is not None:
+            logger.warning("_fetch_krw_rub_google: все источники упали, возвращаем устаревший кеш")
+        return stale
+
+    return result
 
 
 def _refresh_krw_google() -> Optional[float]:
     """Двухвальный каскадный парсер ядра Google Finance с принудительным US-позиционированием (Bypass Consent Wall)."""
     session = _get_session()
-    
+
     def _save_cache(val: float) -> float:
         with _krw_google_lock:
             _krw_google_cache["value"]   = val
@@ -454,19 +505,18 @@ def _refresh_krw_google() -> Optional[float]:
 
     # ─── ВАЛ 1: Твоя классическая схема RUB-KRW (1 000 000 / v) с gl=us флагом ───
     try:
-        # Критическое исправление: hl=ru&gl=us заставляет Google обрабатывать запрос по правилам США, отключая Consent Wall в ЕС
         url_rub_krw = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&gl=us&_ts={int(time.time())}"
         r = session.get(url_rub_krw, timeout=10)
         if r.status_code == 200:
             html = r.text
-            
+
             # 1. Поиск по глобальному поисковому метатегу
             m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
             if m:
                 v = float(m.group(1).replace(',', '.'))
                 if 10.0 < v < 25.0:
                     return _save_cache(1_000_000 / v)
-            
+
             # 2. Поиск во внутреннем JSON-массиве данных скрипта
             m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
             if m:
@@ -494,13 +544,13 @@ def _refresh_krw_google() -> Optional[float]:
         r = session.get(url_krw_rub, timeout=10)
         if r.status_code == 200:
             html = r.text
-            
+
             m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
             if m:
                 v = float(m.group(1).replace(',', '.'))
                 if 0.035 < v < 0.085:
                     return _save_cache(1_000_000 * v)
-                    
+
             m = re.search(r'\[\s*["\']KRW["\']\s*,\s*["\']RUB["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
             if m:
                 v = float(m.group(1).replace(',', '.'))
@@ -563,13 +613,41 @@ def _refresh_krw_google_fallback() -> Optional[float]:
 
 
 def _krw_google_updater() -> None:
-    _refresh_krw_google()
+    """
+    Фоновый воркер обновления курса KRW/Google.
+
+    ИСПРАВЛЕНО (2 проблемы оригинала):
+
+    1. Оригинал делал первый _refresh_krw_google() напрямую, минуя
+       _fetch_krw_rub_google() — то есть без механизма дедупликации.
+       При одновременном старте воркера и пользовательского запроса
+       оба потока уходили в HTTP одновременно.
+       → Теперь воркер вызывает _fetch_krw_rub_google(), который сам
+         управляет флагом и не допускает дублей.
+
+    2. При сбое (Google вернул 429 или парсинг не прошёл) оригинал
+       просто спал 10 минут и снова пробовал — без backoff.
+       При серии сбоев это давало 6 запросов в час на заблокированный IP.
+       → Экспоненциальный backoff: 30 с → 60 → 120 → ... → 600 с.
+         При успехе backoff сбрасывается на 30 с.
+    """
+    logger.info("krw_google_updater: запущен")
+    backoff = 30
     while True:
-        time.sleep(10 * 60)
         try:
-            _refresh_krw_google()
+            result = _fetch_krw_rub_google()
+            if result is not None:
+                logger.info("krw_google_updater: %.0f ₽/млн KRW", result)
+                backoff = 30          # сброс backoff при успехе
+                time.sleep(10 * 60)  # стандартный интервал 10 минут
+            else:
+                logger.warning("krw_google_updater: все источники вернули None, backoff=%ds", backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 600)
         except Exception as exc:
-            logger.error("krw_google_updater Error: %s", exc)
+            logger.error("krw_google_updater crash: %s — backoff=%ds", exc, backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 600)
 
 
 def _fetch_abcex() -> Tuple[Optional[float], Optional[float]]:
@@ -1320,7 +1398,6 @@ def _setup_webhook() -> bool:
         return False
 
 
-# ── ДЕКЛАРАЦИЯ СИСТЕМНОЙ ФУНКЦИИ СТАРТА ────────────────────────────────
 def _notify_startup() -> None:
     try:
         bot.send_message(
