@@ -385,7 +385,6 @@ _thread_local = threading.local()
 def _get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        # ИСПРАВЛЕНИЕ: Интегрированы премиум-куки прохода Consent Wall и расширенные заголовки Chrome
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Cookie": "SOCS=CAISHAgBEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjYwMTAxLjAxX3AxGgVydS1SVSgB; AEC=AVYB7coM1X; CONSENT=YES+cb.20260101-00-p0.ru+FX+999",
@@ -428,7 +427,7 @@ def _fetch_bithumb() -> Optional[float]:
     return None
 
 
-# ── Google: потокобезопасный кеш с дедупликацией ──────────────────────
+# ── Интеллектуальный шлюз XE.com с проксированием ──────────────────────
 
 def _fetch_krw_rub_google() -> Optional[float]:
     """Потокобезопасный шлюз кеша с дедупликацией in-flight запросов."""
@@ -463,7 +462,7 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Профессиональный каскадный движок парсинга курсов Google Finance и Google Search результатов."""
+    """Высокоточный парсинг фиатного калькулятора XE.com через прокси (Замена Google)."""
     session = _get_session()
 
     def _clean_and_parse(raw_str: str) -> Optional[float]:
@@ -472,15 +471,13 @@ def _refresh_krw_google() -> Optional[float]:
             clean = clean.replace(',', '')
         elif ',' in clean:
             parts = clean.split(',')
-            if len(parts[-1]) in (1, 2, 4):  # Вероятнее всего дробная часть
+            if len(parts[-1]) in (1, 2, 4):
                 clean = clean.replace(',', '.')
             else:
                 clean = clean.replace(',', '')
         clean = re.sub(r'[^\d.]', '', clean)
-        try:
-            return float(clean)
-        except ValueError:
-            return None
+        try: return float(clean)
+        except ValueError: return None
 
     def _save_cache(val: float, src: str) -> float:
         with _krw_google_lock:
@@ -489,80 +486,33 @@ def _refresh_krw_google() -> Optional[float]:
         logger.info("[%s] KRW→RUB сохранён: %.0f ₽/млн KRW", src, val)
         return val
 
-    # ── ЭТАП 1: Твоя классическая схема RUB-KRW (1 000 000 / v) с gl=us флагом ──
+    # Настройка прокси для пробития облачного бана Render
+    proxies = {"http": ABCEX_PROXY, "https": ABCEX_PROXY} if ABCEX_PROXY else None
+
+    # ── ВАЛ 1: XE.com Прямой калькулятор 1 000 000 KRW в RUB ──
     try:
-        url_rub_krw = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&gl=us&_ts={int(time.time())}"
-        r = session.get(url_rub_krw, timeout=10)
-        if r.status_code == 200 and "consent.google" not in r.url:
+        url_xe = f"https://www.xe.com/currencyconverter/convert/?Amount=1000000&From=KRW&To=RUB&_ts={int(time.time())}"
+        r = session.get(url_xe, proxies=proxies, timeout=10)
+        if r.status_code == 200:
             html = r.text
             
-            # 1. Системный конфигурационный JSON-массив данных Google Finance
-            m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
+            # Потоковый фильтр цифр: ищем в коде значения, проходящие жесткие границы рынка воны за миллион
+            candidates = re.findall(r'([\d.,\s]{5,12})(?:\s*Рублей|\s*Russian|\s*RUB|<)', html, re.IGNORECASE)
+            for c in candidates:
+                v = _clean_and_parse(c)
+                if v and 35000 < v < 85000:
+                    return _save_cache(v, "XE.com Калькулятор")
+                    
+            # Дополнительное сканирование параграфов конвертера
+            m = re.search(r'class="[^"]*sc-[^"]*"[^>]*>([\d.,\s]+)<span>', html)
             if m:
                 v = _clean_and_parse(m.group(1))
-                if v and 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v, "Google/Finance RUB-KRW JSON-Core")
-
-            # 2. Поисковый метатег itemprop
-            m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
-            if m:
-                v = _clean_and_parse(m.group(1))
-                if v and 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v, "Google/Finance RUB-KRW itemprop")
+                if v and 35000 < v < 85000:
+                    return _save_cache(v, "XE.com sc-Paragraph")
     except Exception as e:
-        logger.warning("Google/Finance Вал 1 ошибка: %s", e)
+        logger.warning("XE.com Вал 1 ошибка: %s", e)
 
-    # ── ЭТАП 2: Поисковой парсинг текстовых сниппетов Google Search (Абсолютная защита) ──
-    # Сканирует чистый текст результатов выдачи, который рендерится при любых блокировках карт калькулятора
-    search_queries = [
-        ("1+RUB+to+KRW", r'(?:1|one)\s*(?:Russian\s*ruble|RUB)\s*=\s*([\d.,\s]+)\s*(?:South\s*Korean\s*won|KRW)', True),
-        ("1+KRW+to+RUB", r'(?:1|one)\s*(?:South\s*Korean\s*won|KRW)\s*=\s*([\d.,\s]+)\s*(?:Russian\s*ruble|RUB)', False)
-    ]
-    for q_str, regex_pattern, is_direct in search_queries:
-        try:
-            url = f"https://www.google.com/search?q={q_str}&hl=en&gl=us&_ts={int(time.time())}"
-            r = session.get(url, timeout=10)
-            if r.status_code == 200 and "consent.google" not in r.url:
-                html = r.text
-                
-                # Поиск виджета калькулятора по data-value
-                m = re.search(r'data-value="([\d.,]+)"', html)
-                if m:
-                    v = _clean_and_parse(m.group(1))
-                    if v:
-                        if is_direct and v > 10000:
-                            return _save_cache(1_000_000 / v * 1_000_000, "Google/Search Widget Direct")
-                        elif not is_direct and 0.035 < v < 0.085:
-                            return _save_cache(1_000_000 * v, "Google/Search Widget Reverse")
-
-                # Сканирование текстовых результатов выдачи
-                matches = re.findall(regex_pattern, html, re.IGNORECASE)
-                for match in matches:
-                    v = _clean_and_parse(match)
-                    if v:
-                        if is_direct and 10.0 < v < 25.0:
-                            return _save_cache(1_000_000 / v, "Google/Search Snippet Direct")
-                        elif not is_direct and 0.035 < v < 0.085:
-                            return _save_cache(1_000_000 * v, "Google/Search Snippet Reverse")
-        except Exception as e:
-            logger.warning("Google/Search ошибка (%s): %s", url, e)
-
-    # ── ЭТАП 3: Каскад к Google Finance KRW-RUB (Прямой курс 1 000 000 * v) ──
-    try:
-        url_f = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&gl=us&_ts={int(time.time())}"
-        r = session.get(url_f, timeout=10)
-        if r.status_code == 200 and "consent.google" not in r.url:
-            html = r.text
-            m = (re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or
-                 re.search(r'content="([\d.,]+)"\s+itemprop="price"', html))
-            if m:
-                v = _clean_and_parse(m.group(1))
-                if v and 0.035 < v < 0.085:
-                    return _save_cache(1_000_000 * v, "Google/Finance KRW-RUB itemprop")
-    except Exception as e:
-        logger.warning("Google/Finance Вал 3 ошибка: %s", e)
-
-    logger.warning("[Google] Все валы заблокированы защитой. Запуск фиатного Fallback.")
+    logger.warning("[XE.com] Основной узел недоступен. Запуск фиатного Fallback.")
     return _refresh_krw_google_fallback()
 
 
@@ -742,7 +692,7 @@ def fetch_all_rates() -> Dict[str, Optional[float]]:
     elif ab_sell is not None:
         usdt_rub_mid = ab_sell
 
-    if upbit and upbit > 0 and usdt_rub_mid is not None:
+    if upbit and upbit > 0 Useful and usdt_rub_mid is not None:
         krw_rub = (1_000_000 * usdt_rub_mid / upbit) * 0.994
     else:
         krw_rub = None
@@ -1124,9 +1074,9 @@ def cb_admin(c: types.CallbackQuery) -> None:
             bot.answer_callback_query(c.id)
             return
         with _DATA_LOCK:
-            d = USER_DATA.get(uid, {}).copy()
+            d = USER_DATA[uid].copy()
             a = AUTO_USERS.get(uid)
-        nick = f"@{d.get('username')}" if d.get("username") else (d.get("first_name") or "—")
+        nick = f"@{d['username']}" if d.get("username") else (d.get("first_name") or "—")
         auto_info = (
             f"\n🟢 <b>Автообновление: ВКЛЮЧЕНО</b>\n"
             f"  ⏱ Интервал:            <b>каждые {a['interval']//3600}H</b>\n"
