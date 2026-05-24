@@ -385,7 +385,7 @@ _thread_local = threading.local()
 def _get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
-        # ИСПРАВЛЕНИЕ: Жёстко зашили куки согласия SOCS и AEC, чтобы полностью обойти Consent Wall в Германии
+        # ИСПРАВЛЕНИЕ: Интегрированы премиум-куки прохода Consent Wall и расширенные заголовки Chrome
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Cookie": "SOCS=CAISHAgBEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjYwMTAxLjAxX3AxGgVydS1SVSgB; AEC=AVYB7coM1X; CONSENT=YES+cb.20260101-00-p0.ru+FX+999",
@@ -393,6 +393,9 @@ def _get_session() -> requests.Session:
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
         })
         _thread_local.session = s
     return _thread_local.session
@@ -460,8 +463,24 @@ def _fetch_krw_rub_google() -> Optional[float]:
 
 
 def _refresh_krw_google() -> Optional[float]:
-    """Профессиональный парсер курса RUB-KRW через ядро Google Finance (Схема 1 000 000 / v)."""
+    """Профессиональный каскадный движок парсинга курсов Google Finance и Google Search результатов."""
     session = _get_session()
+
+    def _clean_and_parse(raw_str: str) -> Optional[float]:
+        clean = raw_str.replace(' ', '').replace('\xa0', '').replace('\u202f', '').strip()
+        if ',' in clean and '.' in clean:
+            clean = clean.replace(',', '')
+        elif ',' in clean:
+            parts = clean.split(',')
+            if len(parts[-1]) in (1, 2, 4):  # Вероятнее всего дробная часть
+                clean = clean.replace(',', '.')
+            else:
+                clean = clean.replace(',', '')
+        clean = re.sub(r'[^\d.]', '', clean)
+        try:
+            return float(clean)
+        except ValueError:
+            return None
 
     def _save_cache(val: float, src: str) -> float:
         with _krw_google_lock:
@@ -470,62 +489,78 @@ def _refresh_krw_google() -> Optional[float]:
         logger.info("[%s] KRW→RUB сохранён: %.0f ₽/млн KRW", src, val)
         return val
 
-    # ── ВАЛ 1: Твоя классическая схема RUB-KRW (1 000 000 / v) с gl=us флагом ──
+    # ── ЭТАП 1: Твоя классическая схема RUB-KRW (1 000 000 / v) с gl=us флагом ──
     try:
-        # ИСПРАВЛЕНИЕ: Параметр gl=us принудительно переключает Google во Франкфурте на американские правила, убирая Consent Wall
         url_rub_krw = f"https://www.google.com/finance/quote/RUB-KRW?hl=ru&gl=us&_ts={int(time.time())}"
         r = session.get(url_rub_krw, timeout=10)
         if r.status_code == 200 and "consent.google" not in r.url:
             html = r.text
             
-            # 1. Поиск по неизменяемому JSON-массиву данных конфигурации Google
+            # 1. Системный конфигурационный JSON-массив данных Google Finance
             m = re.search(r'\[\s*["\']RUB["\']\s*,\s*["\']KRW["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
             if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v, "Google/Finance JSON-Core")
+                v = _clean_and_parse(m.group(1))
+                if v and 10.0 < v < 25.0:
+                    return _save_cache(1_000_000 / v, "Google/Finance RUB-KRW JSON-Core")
 
-            # 2. Поиск по глобальному метатегу поисковых систем
+            # 2. Поисковый метатег itemprop
             m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
             if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 10.0 < v < 25.0:
-                    return _save_cache(1_000_000 / v, "Google/Finance itemprop")
-
-            # 3. Парсинг по классам европейской верстки
-            container_matches = re.findall(r'class="[^"]*(?:fxKbKc|YMlKec)[^"]*"[^>]*>([^<]+)<', html)
-            for c in container_matches:
-                clean_str = c.replace(',', '.').replace(' ', '').replace('\xa0', '').strip()
-                clean_str = re.sub(r'[^\d.]', '', clean_str)
-                if not clean_str: continue
-                try:
-                    v = float(clean_str)
-                    if 10.0 < v < 25.0:
-                        return _save_cache(1_000_000 / v, "Google/Finance HTML-Class")
-                except ValueError: continue
+                v = _clean_and_parse(m.group(1))
+                if v and 10.0 < v < 25.0:
+                    return _save_cache(1_000_000 / v, "Google/Finance RUB-KRW itemprop")
     except Exception as e:
         logger.warning("Google/Finance Вал 1 ошибка: %s", e)
 
-    # ── ВАЛ 2: Резервный кросс-поиск пары KRW-RUB (1 000 000 * v) с gl=us флагом ──
+    # ── ЭТАП 2: Поисковой парсинг текстовых сниппетов Google Search (Абсолютная защита) ──
+    # Сканирует чистый текст результатов выдачи, который рендерится при любых блокировках карт калькулятора
+    search_queries = [
+        ("1+RUB+to+KRW", r'(?:1|one)\s*(?:Russian\s*ruble|RUB)\s*=\s*([\d.,\s]+)\s*(?:South\s*Korean\s*won|KRW)', True),
+        ("1+KRW+to+RUB", r'(?:1|one)\s*(?:South\s*Korean\s*won|KRW)\s*=\s*([\d.,\s]+)\s*(?:Russian\s*ruble|RUB)', False)
+    ]
+    for q_str, regex_pattern, is_direct in search_queries:
+        try:
+            url = f"https://www.google.com/search?q={q_str}&hl=en&gl=us&_ts={int(time.time())}"
+            r = session.get(url, timeout=10)
+            if r.status_code == 200 and "consent.google" not in r.url:
+                html = r.text
+                
+                # Поиск виджета калькулятора по data-value
+                m = re.search(r'data-value="([\d.,]+)"', html)
+                if m:
+                    v = _clean_and_parse(m.group(1))
+                    if v:
+                        if is_direct and v > 10000:
+                            return _save_cache(1_000_000 / v * 1_000_000, "Google/Search Widget Direct")
+                        elif not is_direct and 0.035 < v < 0.085:
+                            return _save_cache(1_000_000 * v, "Google/Search Widget Reverse")
+
+                # Сканирование текстовых результатов выдачи
+                matches = re.findall(regex_pattern, html, re.IGNORECASE)
+                for match in matches:
+                    v = _clean_and_parse(match)
+                    if v:
+                        if is_direct and 10.0 < v < 25.0:
+                            return _save_cache(1_000_000 / v, "Google/Search Snippet Direct")
+                        elif not is_direct and 0.035 < v < 0.085:
+                            return _save_cache(1_000_000 * v, "Google/Search Snippet Reverse")
+        except Exception as e:
+            logger.warning("Google/Search ошибка (%s): %s", url, e)
+
+    # ── ЭТАП 3: Каскад к Google Finance KRW-RUB (Прямой курс 1 000 000 * v) ──
     try:
-        url_krw_rub = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&gl=us&_ts={int(time.time())}"
-        r = session.get(url_krw_rub, timeout=10)
+        url_f = f"https://www.google.com/finance/quote/KRW-RUB?hl=ru&gl=us&_ts={int(time.time())}"
+        r = session.get(url_f, timeout=10)
         if r.status_code == 200 and "consent.google" not in r.url:
             html = r.text
-            
-            m = re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or re.search(r'content="([\d.,]+)"\s+itemprop="price"', html)
+            m = (re.search(r'itemprop="price"\s+content="([\d.,]+)"', html) or
+                 re.search(r'content="([\d.,]+)"\s+itemprop="price"', html))
             if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 0.035 < v < 0.085:
-                    return _save_cache(1_000_000 * v, "Google/Finance Reverse itemprop")
-                    
-            m = re.search(r'\[\s*["\']KRW["\']\s*,\s*["\']RUB["\']\s*,\s*["\']?([\d.,]+)["\']?', html, re.IGNORECASE)
-            if m:
-                v = float(m.group(1).replace(',', '.'))
-                if 0.035 < v < 0.085:
-                    return _save_cache(1_000_000 * v, "Google/Finance Reverse JSON-Core")
+                v = _clean_and_parse(m.group(1))
+                if v and 0.035 < v < 0.085:
+                    return _save_cache(1_000_000 * v, "Google/Finance KRW-RUB itemprop")
     except Exception as e:
-        logger.warning("Google/Finance Вал 2 ошибка: %s", e)
+        logger.warning("Google/Finance Вал 3 ошибка: %s", e)
 
     logger.warning("[Google] Все валы заблокированы защитой. Запуск фиатного Fallback.")
     return _refresh_krw_google_fallback()
@@ -942,6 +977,7 @@ def _feedback_receive(m: types.Message) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 #  АВТООБНОВЛЕНИЕ — ПОЛЬЗОВАТЕЛЬ
 # ═══════════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["auto"])
 @bot.message_handler(func=lambda m: m.text in (
     LANGS["ru"]["btn_auto"], LANGS["en"]["btn_auto"]
 ))
